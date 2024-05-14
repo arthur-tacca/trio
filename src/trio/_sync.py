@@ -73,7 +73,7 @@ class Event:
         if not self._flag:
             self._flag = True
             for task in self._tasks:
-                _core.reschedule(task)
+                _core.reschedule(task, allow_abort=True)
             self._tasks.clear()
 
     async def wait(self) -> None:
@@ -89,7 +89,7 @@ class Event:
             self._tasks.add(task)
 
             def abort_fn(_: RaiseCancelT) -> Abort:
-                self._tasks.remove(task)
+                self._tasks.discard(task)
                 return _core.Abort.SUCCEEDED
 
             await _core.wait_task_rescheduled(abort_fn)

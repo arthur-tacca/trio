@@ -1441,7 +1441,13 @@ class Task(metaclass=NoPublicConstructor):
         # whether we succeeded or failed.
         self._abort_func = None
         if success is Abort.SUCCEEDED:
-            self._runner.reschedule(self, capture(raise_cancel))
+            if self._next_send is None:
+                self._runner.reschedule(self, capture(raise_cancel))
+            else:
+                # reschedule(..., allow_abort=True) has already been called,
+                # so this task is already in the run queue. All we need to do
+                # is replace the outcome that will be used.
+                self._next_send = capture(raise_cancel)
 
     def _attempt_delivery_of_any_pending_cancel(self) -> None:
         if self._abort_func is None:
@@ -1695,7 +1701,7 @@ class Runner:
 
     @_public  # Type-ignore due to use of Any here.
     def reschedule(  # type: ignore[misc]
-        self, task: Task, next_send: Outcome[Any] = _NO_SEND
+        self, task: Task, next_send: Outcome[Any] = _NO_SEND, allow_abort: bool = False
     ) -> None:
         """Reschedule the given task with the given
         :class:`outcome.Outcome`.
@@ -1707,11 +1713,20 @@ class Runner:
         returning :data:`Abort.SUCCEEDED` from an abort callback is equivalent
         to calling :func:`reschedule` once.)
 
+        As an exception, if ``allow_abort`` is ``True`` then the abort
+        callback may still be called up until the rescheduled coroutine
+        actually resumes. If that happens, and the abort function returns
+        ``Abort.SUCCEEDED``, then there are effectively two calls, with the
+        abort always happening second. In that case, any result passed to this
+        function (as the ``next_send`` argument) will be silently discarded.
+
         Args:
           task (trio.lowlevel.Task): the task to be rescheduled. Must be blocked
               in a call to :func:`wait_task_rescheduled`.
           next_send (outcome.Outcome): the value (or error) to return (or
               raise) from :func:`wait_task_rescheduled`.
+          allow_abort (bool): whether the abort function may still be called
+              after this function is called.
 
         """
         if next_send is _NO_SEND:
@@ -1721,7 +1736,8 @@ class Runner:
         assert task._next_send_fn is None
         task._next_send_fn = task.coro.send
         task._next_send = next_send
-        task._abort_func = None
+        if not allow_abort:
+            task._abort_func = None
         task.custom_sleep_data = None
         if not self.runq and self.is_guest:
             self.force_guest_tick_asap()
@@ -2602,7 +2618,7 @@ def unrolled_run(
 
                 next_send_fn = task._next_send_fn
                 next_send = task._next_send
-                task._next_send_fn = task._next_send = None
+                task._next_send_fn = task._next_send = task._abort_func = None
                 final_outcome: Outcome[Any] | None = None
                 try:
                     # We used to unwrap the Outcome object here and send/throw

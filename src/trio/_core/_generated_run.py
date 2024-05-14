@@ -101,7 +101,9 @@ def current_root_task() -> Task | None:
         raise RuntimeError("must be called from async context") from None
 
 
-def reschedule(task: Task, next_send: Outcome[Any] = _NO_SEND) -> None:
+def reschedule(
+    task: Task, next_send: Outcome[Any] = _NO_SEND, allow_abort: bool = False
+) -> None:
     """Reschedule the given task with the given
     :class:`outcome.Outcome`.
 
@@ -112,16 +114,25 @@ def reschedule(task: Task, next_send: Outcome[Any] = _NO_SEND) -> None:
     returning :data:`Abort.SUCCEEDED` from an abort callback is equivalent
     to calling :func:`reschedule` once.)
 
+    As an exception, if ``allow_abort`` is ``True`` then the abort
+    callback may still be called up until the rescheduled coroutine
+    actually resumes. In that case, there are effectively two calls, with
+    the abort always happening second. Note that any outcome passed to
+    this function (as the ``next_send`` argument) will be silently
+    discarded if that happens.
+
     Args:
       task (trio.lowlevel.Task): the task to be rescheduled. Must be blocked
           in a call to :func:`wait_task_rescheduled`.
       next_send (outcome.Outcome): the value (or error) to return (or
           raise) from :func:`wait_task_rescheduled`.
+      allow_abort (bool): whether the abort function may still be called
+          after this function is called.
 
     """
     locals()[LOCALS_KEY_KI_PROTECTION_ENABLED] = True
     try:
-        return GLOBAL_RUN_CONTEXT.runner.reschedule(task, next_send)
+        return GLOBAL_RUN_CONTEXT.runner.reschedule(task, next_send, allow_abort)
     except AttributeError:
         raise RuntimeError("must be called from async context") from None
 
