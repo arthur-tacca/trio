@@ -24,9 +24,9 @@ def test_mock_clock() -> None:
     with pytest.raises(ValueError, match=r"^time can't go backwards$"):
         c.jump(-1)
     assert c.current_time() == 1.2
-    assert c.deadline_to_sleep_time(1.1, have_idle_waiters=False) == 0
-    assert c.deadline_to_sleep_time(1.2, have_idle_waiters=False) == 0
-    assert c.deadline_to_sleep_time(1.3, have_idle_waiters=False) == inf
+    assert c.relative_deadline_to_sleep_time(-0.1, have_idle_waiters=False) == 0
+    assert c.relative_deadline_to_sleep_time(0, have_idle_waiters=False) == 0
+    assert c.relative_deadline_to_sleep_time(0.1, have_idle_waiters=False) == inf
 
     with pytest.raises(ValueError, match=r"^rate must be >= 0$"):
         c.rate = -1
@@ -36,15 +36,15 @@ def test_mock_clock() -> None:
     assert c.current_time() == 1.2
     REAL_NOW += 1
     assert c.current_time() == 3.2
-    assert c.deadline_to_sleep_time(3.1, have_idle_waiters=False) == 0
-    assert c.deadline_to_sleep_time(3.2, have_idle_waiters=False) == 0
-    assert c.deadline_to_sleep_time(4.2, have_idle_waiters=False) == 0.5
+    assert c.relative_deadline_to_sleep_time(-0.1, have_idle_waiters=False) == 0
+    assert c.relative_deadline_to_sleep_time(0, have_idle_waiters=False) == 0
+    assert c.relative_deadline_to_sleep_time(1.0, have_idle_waiters=False) == 0.5
 
     c.rate = 0.5
     assert c.current_time() == 3.2
-    assert c.deadline_to_sleep_time(3.1, have_idle_waiters=False) == 0
-    assert c.deadline_to_sleep_time(3.2, have_idle_waiters=False) == 0
-    assert c.deadline_to_sleep_time(4.2, have_idle_waiters=False) == 2.0
+    assert c.relative_deadline_to_sleep_time(-0.1, have_idle_waiters=False) == 0
+    assert c.relative_deadline_to_sleep_time(0, have_idle_waiters=False) == 0
+    assert c.relative_deadline_to_sleep_time(1.0, have_idle_waiters=False) == 2.0
 
     c.jump(0.8)
     assert c.current_time() == 4.0
@@ -183,13 +183,13 @@ def test_conversion_takes_the_runner_facts_as_parameters() -> None:
     # a run even with autojumping armed (reaching for the runner's statistics
     # here would raise "must be called from async/task context").
     c = MockClock(autojump_threshold=1)
-    assert c.deadline_to_sleep_time(10, have_idle_waiters=False) == 1
+    assert c.relative_deadline_to_sleep_time(10, have_idle_waiters=False) == 1
     assert c._jump_to == 10
 
     # Tasks in wait_all_tasks_blocked wake without the clock moving, so a
     # pending waiter declines the shortened sleep and nothing is stashed.
     c = MockClock(autojump_threshold=1)
-    assert c.deadline_to_sleep_time(10, have_idle_waiters=True) == inf
+    assert c.relative_deadline_to_sleep_time(10, have_idle_waiters=True) == inf
     assert c._jump_to is None
 
 
@@ -199,18 +199,37 @@ def test_an_infinite_threshold_never_primes() -> None:
     # for it the running case would prime a jump to infinity, and the frozen
     # case would be saved only by inf * 0 being nan.
     c = MockClock()  # frozen
-    assert c.deadline_to_sleep_time(10, have_idle_waiters=False) == inf
+    assert c.relative_deadline_to_sleep_time(10, have_idle_waiters=False) == inf
     assert c._jump_to is None
 
     c = MockClock(rate=1)  # running, with nothing scheduled
-    assert c.deadline_to_sleep_time(inf, have_idle_waiters=False) == inf
+    assert c.relative_deadline_to_sleep_time(inf, have_idle_waiters=False) == inf
     assert c._jump_to is None
+
+
+def test_jump_target_accounts_for_our_time_passing_during_the_wait() -> None:
+    # We are handed a span, but with rate > 0 our own time advances while
+    # the run waits, so the span is stashed as an instant on our scale and
+    # the jump covers only the distance that is left. Jumping by the span
+    # itself would land past the deadline.
+    REAL_NOW = 100.0
+    c = MockClock(autojump_threshold=0.5)
+    c._real_clock = lambda: REAL_NOW
+    c.rate = 1  # rebases onto our fake real clock
+    assert c.current_time() == 0
+
+    assert c.relative_deadline_to_sleep_time(10, have_idle_waiters=False) == 0.5
+    REAL_NOW += 0.5  # the wait ran its shortened timeout...
+    assert c.current_time() == 0.5  # ...and our time moved with it
+
+    c.wait_has_ended(saw_events=False, anything_runnable=False)
+    assert c.current_time() == 10
 
 
 def test_wait_has_ended_jumps_only_after_a_wait_that_produced_nothing() -> None:
     def primed_clock() -> MockClock:
         c = MockClock(autojump_threshold=1)
-        assert c.deadline_to_sleep_time(10, have_idle_waiters=False) == 1
+        assert c.relative_deadline_to_sleep_time(10, have_idle_waiters=False) == 1
         assert c._jump_to == 10
         return c
 
@@ -247,7 +266,7 @@ def test_start_clock_resets_the_stash() -> None:
     # and hearing the wait's outcome must not leak it into a new run using
     # the same clock.
     c = MockClock(autojump_threshold=1)
-    assert c.deadline_to_sleep_time(10, have_idle_waiters=False) == 1
+    assert c.relative_deadline_to_sleep_time(10, have_idle_waiters=False) == 1
     assert c._jump_to == 10
     c.start_clock()
     assert c._jump_to is None

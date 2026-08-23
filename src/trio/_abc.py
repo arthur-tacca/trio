@@ -42,37 +42,45 @@ class Clock(ABC):
         """
 
     @abstractmethod
-    def deadline_to_sleep_time(
+    def relative_deadline_to_sleep_time(
         self,
-        deadline: float,
+        relative_deadline: float,
         *,
         have_idle_waiters: bool,
     ) -> float:
-        """Compute the real time until the given deadline.
+        """Convert a span of this clock's time into real time.
 
         This is called before we enter a system-specific wait function like
         :func:`select.select`, to get the timeout to pass.
 
-        For a clock using wall-time, this should be something like::
+        For a clock that runs at wall-clock rate this is just::
 
-           return deadline - self.current_time()
+           return relative_deadline
 
         but of course it may be different if you're implementing some kind of
-        virtual clock. A virtual clock may deliberately return *less* than
-        the true answer: the run loop simply wakes early and reports what
-        the wait produced through :meth:`wait_has_ended`.
+        virtual clock -- a clock whose time is frozen, for instance, can
+        return :data:`math.inf` to say that no amount of real waiting will
+        ever get there. A virtual clock may also deliberately return *less*
+        than the true answer: the run loop simply wakes early and reports
+        what the wait produced through :meth:`wait_has_ended`.
+
+        Deadlines cross this interface as relative spans, never as absolute
+        instants, so a clock that reports time on a different origin from
+        the clock it wraps has nothing to translate.
 
         Args:
-            deadline (float): The absolute time of the next deadline,
-                according to this clock.
+            relative_deadline (float): How far in the future the next
+                deadline is, in this clock's own time. May be negative (the
+                deadline has already passed) or :data:`math.inf` (there is
+                no deadline).
             have_idle_waiters (bool): Whether any tasks are waiting in
                 :func:`trio.testing.wait_all_tasks_blocked`. They wake after
                 an idle stretch without the clock having to move, so a
                 virtual clock should not skip time past them.
 
         Returns:
-            float: The number of real seconds to sleep until the given
-            deadline. May be :data:`math.inf`.
+            float: The number of real seconds to sleep. May be
+            :data:`math.inf`.
 
         """
 

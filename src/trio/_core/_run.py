@@ -203,13 +203,13 @@ class SystemClock(Clock):
     def current_time(self) -> float:
         return self.offset + perf_counter()
 
-    def deadline_to_sleep_time(
+    def relative_deadline_to_sleep_time(
         self,
-        deadline: float,
+        relative_deadline: float,
         *,
         have_idle_waiters: bool,
     ) -> float:
-        return deadline - self.current_time()
+        return relative_deadline
 
 
 ################################################################
@@ -2739,8 +2739,8 @@ def unrolled_run(
                 # The clock is told about wait_all_tasks_blocked waiters
                 # because they wake without it having to move (see below), so
                 # a virtual clock must not skip time past them.
-                timeout = runner.clock.deadline_to_sleep_time(
-                    deadline,
+                timeout = runner.clock.relative_deadline_to_sleep_time(
+                    deadline - runner.clock.current_time(),
                     have_idle_waiters=bool(runner.waiting_for_idle),
                 )
             timeout = min(max(0, timeout), _MAX_TIMEOUT)
@@ -2765,9 +2765,9 @@ def unrolled_run(
 
             # Report the wait's outcome to the clock. This is how a virtual
             # clock learns that the run went idle: it shortened its answer in
-            # deadline_to_sleep_time on purpose, and a shortened wait that
-            # produced nothing proves that no amount of further real waiting
-            # would wake anyone.
+            # relative_deadline_to_sleep_time on purpose, and a shortened
+            # wait that produced nothing proves that no amount of further
+            # real waiting would wake anyone.
             runner.clock.wait_has_ended(
                 saw_events=bool(events),
                 anything_runnable=bool(runner.runq),

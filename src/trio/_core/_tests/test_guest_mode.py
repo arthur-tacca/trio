@@ -183,9 +183,9 @@ def test_guest_is_initialized_when_start_returns() -> None:
         def current_time(self) -> float:
             raise NotImplementedError()
 
-        def deadline_to_sleep_time(
+        def relative_deadline_to_sleep_time(
             self,
-            deadline: float,
+            relative_deadline: float,
             *,
             have_idle_waiters: bool,
         ) -> float:

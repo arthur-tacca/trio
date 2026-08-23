@@ -122,19 +122,18 @@ class MockClock(Clock):
     def current_time(self) -> float:
         return self._real_to_virtual(self._real_clock())
 
-    def deadline_to_sleep_time(
+    def relative_deadline_to_sleep_time(
         self,
-        deadline: float,
+        relative_deadline: float,
         *,
         have_idle_waiters: bool,
     ) -> float:
-        virtual_timeout = deadline - self.current_time()
-        if virtual_timeout <= 0:
+        if relative_deadline <= 0:
             return 0
         # The real seconds we would sleep if we were not watching for an
         # idle stretch. Our time is frozen at rate 0, so then no amount of
         # real waiting reaches the deadline.
-        natural = virtual_timeout / self._rate if self._rate > 0 else inf
+        natural = relative_deadline / self._rate if self._rate > 0 else inf
         if (
             # Both sides are real seconds, which is the unit the threshold
             # is quoted in; inf ("never autojump", the default) then simply
@@ -148,7 +147,11 @@ class MockClock(Clock):
             # Deliberately answer less than the truth: if the run then sits
             # idle for this whole shortened timeout, wait_has_ended jumps us
             # onto the deadline.
-            self._jump_to = deadline
+            #
+            # The span is stashed as an instant on our own scale, so that if
+            # our time advances during the wait (rate > 0) we jump only the
+            # distance that is left.
+            self._jump_to = self.current_time() + relative_deadline
             return self.autojump_threshold
         return natural
 
