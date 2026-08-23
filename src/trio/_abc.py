@@ -65,6 +65,9 @@ class Clock(ABC):
 
         """
 
+    def propagate(self, timeout: float) -> None:  # TODO: think about migration
+        pass
+
 
 class Instrument(ABC):  # noqa: B024  # conceptually is ABC
     """The interface for run loop instrumentation.

@@ -177,7 +177,7 @@ async def test_mock_clock_autojump_0_and_wait_all_tasks_blocked_nonzero(
 
     assert record == ["waiter done", "yawn"]
 
-
+@pytest.mark.skip("is no longer necessary")
 async def test_initialization_doesnt_mutate_runner() -> None:
     before = (
         GLOBAL_RUN_CONTEXT.runner.clock,

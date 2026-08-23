@@ -1701,6 +1701,8 @@ class RunStatistics:
       backend. This always has an attribute ``backend`` which is a string
       naming which operating-system-specific I/O backend is in use; the
       other attributes vary between backends.
+    * ``idle_waiters`` (int): The number of tasks waiting in
+      `Runner.wait_all_tasks_blocked`.
     """
 
     tasks_living: int
@@ -1708,6 +1710,7 @@ class RunStatistics:
     seconds_to_next_deadline: float
     io_statistics: IOStatistics
     run_sync_soon_queue_size: int
+    idle_waiters: int
 
 
 # This holds all the state that gets trampolined back and forth between
@@ -1809,7 +1812,7 @@ class Runner:  # type: ignore[explicit-any]
     asyncgens: AsyncGenerators = attrs.Factory(AsyncGenerators)
 
     # If everything goes idle for this long, we call clock._autojump()
-    clock_autojump_threshold: float = inf
+    # clock_autojump_threshold: float = inf
 
     # Guest mode stuff
     is_guest: bool = False
@@ -1861,6 +1864,7 @@ class Runner:  # type: ignore[explicit-any]
             seconds_to_next_deadline=seconds_to_next_deadline,
             io_statistics=self.io_manager.statistics(),
             run_sync_soon_queue_size=self.entry_queue.size(),
+            idle_waiters=len(self.waiting_for_idle),
         )
 
     @_public
@@ -2752,9 +2756,9 @@ def unrolled_run(
             # We use 'elif' here because if there are tasks in
             # wait_all_tasks_blocked, then those tasks will wake up without
             # jumping the clock, so we don't need to autojump.
-            elif runner.clock_autojump_threshold < timeout:
-                timeout = runner.clock_autojump_threshold
-                idle_primed = IdlePrimedTypes.AUTOJUMP_CLOCK
+            # elif runner.clock_autojump_threshold < timeout:
+            #     timeout = runner.clock_autojump_threshold
+            #     idle_primed = IdlePrimedTypes.AUTOJUMP_CLOCK
 
             if "before_io_wait" in runner.instruments:
                 runner.instruments.call("before_io_wait", timeout)
@@ -2766,6 +2770,8 @@ def unrolled_run(
 
             if "after_io_wait" in runner.instruments:
                 runner.instruments.call("after_io_wait", timeout)
+
+            runner.clock.propagate(timeout)
 
             # Process cancellations due to deadline expiry
             now = runner.clock.current_time()
@@ -2802,10 +2808,6 @@ def unrolled_run(
                             runner.reschedule(task)
                         else:
                             break
-                else:
-                    assert idle_primed is IdlePrimedTypes.AUTOJUMP_CLOCK
-                    assert isinstance(runner.clock, _core.MockClock)
-                    runner.clock._autojump()
 
             # Process all runnable tasks, but only the ones that are already
             # runnable now. Anything that becomes runnable during this cycle

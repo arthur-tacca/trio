@@ -70,6 +70,7 @@ class MockClock(Clock):
         self._real_base = 0.0
         self._virtual_base = 0.0
         self._rate = 0.0
+        self._jump_to: float | None = None
 
         # kept as an attribute so that our tests can monkeypatch it
         self._real_clock = time.perf_counter
@@ -118,9 +119,9 @@ class MockClock(Clock):
                 runner.force_guest_tick_asap()
         except AttributeError:
             pass
-        else:
-            if runner.clock is self:
-                runner.clock_autojump_threshold = self._autojump_threshold
+        # else:
+        #     if runner.clock is self:
+        #         runner.clock_autojump_threshold = self._autojump_threshold
 
     # Invoked by the run loop when runner.clock_autojump_threshold is
     # exceeded.
@@ -145,6 +146,12 @@ class MockClock(Clock):
         virtual_timeout = deadline - self.current_time()
         if virtual_timeout <= 0:
             return 0
+        elif (
+            self.autojump_threshold * self._rate <= virtual_timeout and
+            _core.current_statistics().idle_waiters == 0
+        ):
+            self._jump_to = deadline
+            return self.autojump_threshold
         elif self._rate > 0:
             return virtual_timeout / self._rate
         else:
@@ -163,3 +170,11 @@ class MockClock(Clock):
         if seconds < 0:
             raise ValueError("time can't go backwards")
         self._virtual_base += seconds
+
+    def propagate(self, timeout: float) -> None:
+        # we base most parts off a system clock, so this is unnecessary
+        # except for:
+        if self._jump_to:
+            # we really should just rely on `self._jump_to`...
+            self._autojump()  # temp
+            self._jump_to = None
