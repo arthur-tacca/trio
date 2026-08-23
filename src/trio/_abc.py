@@ -42,7 +42,12 @@ class Clock(ABC):
         """
 
     @abstractmethod
-    def deadline_to_sleep_time(self, deadline: float) -> float:
+    def deadline_to_sleep_time(
+        self,
+        deadline: float,
+        *,
+        have_idle_waiters: bool,
+    ) -> float:
         """Compute the real time until the given deadline.
 
         This is called before we enter a system-specific wait function like
@@ -53,11 +58,17 @@ class Clock(ABC):
            return deadline - self.current_time()
 
         but of course it may be different if you're implementing some kind of
-        virtual clock.
+        virtual clock. A virtual clock may deliberately return *less* than
+        the true answer: the run loop simply wakes early and reports what
+        the wait produced through :meth:`wait_has_ended`.
 
         Args:
             deadline (float): The absolute time of the next deadline,
                 according to this clock.
+            have_idle_waiters (bool): Whether any tasks are waiting in
+                :func:`trio.testing.wait_all_tasks_blocked`. They wake after
+                an idle stretch without the clock having to move, so a
+                virtual clock should not skip time past them.
 
         Returns:
             float: The number of real seconds to sleep until the given
@@ -65,8 +76,25 @@ class Clock(ABC):
 
         """
 
-    def propagate(self, timeout: float) -> None:  # TODO: think about migration
-        pass
+    def wait_has_ended(  # noqa: B027  # the empty default is deliberate
+        self,
+        *,
+        saw_events: bool,
+        anything_runnable: bool,
+    ) -> None:
+        """Called after every IO wait, with what the wait produced.
+
+        ``saw_events`` says whether the wait returned IO events;
+        ``anything_runnable`` says whether any task is runnable now that
+        those events have been processed. A wait that ran its full timeout
+        and produced nothing is proof that the run is idle: nothing can
+        happen until time passes.
+
+        A clock measuring real time has nothing to do here (the default). A
+        virtual clock can respond to a proven-idle wait by advancing its
+        time.
+
+        """
 
 
 class Instrument(ABC):  # noqa: B024  # conceptually is ABC

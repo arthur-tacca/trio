@@ -1,10 +1,8 @@
 import time
 from math import inf
 
-from .. import _core
 from .._abc import Clock
 from .._util import final
-from ._run import GLOBAL_RUN_CONTEXT
 
 ################################################################
 # The glorious MockClock
@@ -70,6 +68,9 @@ class MockClock(Clock):
         self._real_base = 0.0
         self._virtual_base = 0.0
         self._rate = 0.0
+        # The deadline stashed by a conversion that shortened its answer to
+        # autojump_threshold so the run loop would report back; consumed
+        # (and always cleared) by wait_has_ended once it does.
         self._jump_to: float | None = None
 
         # kept as an attribute so that our tests can monkeypatch it
@@ -103,33 +104,9 @@ class MockClock(Clock):
 
     @autojump_threshold.setter
     def autojump_threshold(self, new_autojump_threshold: float) -> None:
+        # The threshold is read fresh at every conversion, so a change takes
+        # effect on the run loop's next pass.
         self._autojump_threshold = float(new_autojump_threshold)
-        self._try_resync_autojump_threshold()
-
-    # runner.clock_autojump_threshold is an internal API that isn't easily
-    # usable by custom third-party Clock objects. If you need access to this
-    # functionality, let us know, and we'll figure out how to make a public
-    # API. Discussion:
-    #
-    #     https://github.com/python-trio/trio/issues/1587
-    def _try_resync_autojump_threshold(self) -> None:
-        try:
-            runner = GLOBAL_RUN_CONTEXT.runner
-            if runner.is_guest:
-                runner.force_guest_tick_asap()
-        except AttributeError:
-            pass
-        # else:
-        #     if runner.clock is self:
-        #         runner.clock_autojump_threshold = self._autojump_threshold
-
-    # Invoked by the run loop when runner.clock_autojump_threshold is
-    # exceeded.
-    def _autojump(self) -> None:
-        statistics = _core.current_statistics()
-        jump = statistics.seconds_to_next_deadline
-        if 0 < jump < inf:
-            self.jump(jump)
 
     def _real_to_virtual(self, real: float) -> float:
         real_offset = real - self._real_base
@@ -137,25 +114,43 @@ class MockClock(Clock):
         return self._virtual_base + virtual_offset
 
     def start_clock(self) -> None:
-        self._try_resync_autojump_threshold()
+        # The stash is run-scoped: a run that tore down between priming a
+        # jump and hearing the wait's outcome must not leak it into a new
+        # run using the same clock.
+        self._jump_to = None
 
     def current_time(self) -> float:
         return self._real_to_virtual(self._real_clock())
 
-    def deadline_to_sleep_time(self, deadline: float) -> float:
+    def deadline_to_sleep_time(
+        self,
+        deadline: float,
+        *,
+        have_idle_waiters: bool,
+    ) -> float:
         virtual_timeout = deadline - self.current_time()
         if virtual_timeout <= 0:
             return 0
-        elif (
-            self.autojump_threshold * self._rate <= virtual_timeout and
-            _core.current_statistics().idle_waiters == 0
+        # The real seconds we would sleep if we were not watching for an
+        # idle stretch. Our time is frozen at rate 0, so then no amount of
+        # real waiting reaches the deadline.
+        natural = virtual_timeout / self._rate if self._rate > 0 else inf
+        if (
+            # Both sides are real seconds, which is the unit the threshold
+            # is quoted in; inf ("never autojump", the default) then simply
+            # fails to be less than anything.
+            self.autojump_threshold < natural
+            # Tasks in wait_all_tasks_blocked wake after an idle stretch
+            # without our time moving at all, so while any are pending we
+            # decline to set up a jump that would skip past them.
+            and not have_idle_waiters
         ):
+            # Deliberately answer less than the truth: if the run then sits
+            # idle for this whole shortened timeout, wait_has_ended jumps us
+            # onto the deadline.
             self._jump_to = deadline
             return self.autojump_threshold
-        elif self._rate > 0:
-            return virtual_timeout / self._rate
-        else:
-            return 999999999
+        return natural
 
     def jump(self, seconds: float) -> None:
         """Manually advance the clock by the given number of seconds.
@@ -171,10 +166,20 @@ class MockClock(Clock):
             raise ValueError("time can't go backwards")
         self._virtual_base += seconds
 
-    def propagate(self, timeout: float) -> None:
-        # we base most parts off a system clock, so this is unnecessary
-        # except for:
-        if self._jump_to:
-            # we really should just rely on `self._jump_to`...
-            self._autojump()  # temp
-            self._jump_to = None
+    def wait_has_ended(
+        self,
+        *,
+        saw_events: bool,
+        anything_runnable: bool,
+    ) -> None:
+        # A jump needs two facts with different owners: ours, that the
+        # conversion shortened its answer on purpose (the stash); and the
+        # run loop's, that the wait produced nothing. An unprimed wait must
+        # never jump, however idle - a natural sleep that reaches its
+        # deadline is not an observation window.
+        jump_to, self._jump_to = self._jump_to, None
+        if jump_to is None or saw_events or anything_runnable:
+            return
+        jump = jump_to - self.current_time()
+        if 0 < jump < inf:
+            self.jump(jump)

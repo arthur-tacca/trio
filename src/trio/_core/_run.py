@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import enum
 import functools
 import gc
 import itertools
@@ -204,13 +203,13 @@ class SystemClock(Clock):
     def current_time(self) -> float:
         return self.offset + perf_counter()
 
-    def deadline_to_sleep_time(self, deadline: float) -> float:
+    def deadline_to_sleep_time(
+        self,
+        deadline: float,
+        *,
+        have_idle_waiters: bool,
+    ) -> float:
         return deadline - self.current_time()
-
-
-class IdlePrimedTypes(enum.Enum):
-    WAITING_FOR_IDLE = 1
-    AUTOJUMP_CLOCK = 2
 
 
 ################################################################
@@ -1701,8 +1700,6 @@ class RunStatistics:
       backend. This always has an attribute ``backend`` which is a string
       naming which operating-system-specific I/O backend is in use; the
       other attributes vary between backends.
-    * ``idle_waiters`` (int): The number of tasks waiting in
-      `Runner.wait_all_tasks_blocked`.
     """
 
     tasks_living: int
@@ -1710,7 +1707,6 @@ class RunStatistics:
     seconds_to_next_deadline: float
     io_statistics: IOStatistics
     run_sync_soon_queue_size: int
-    idle_waiters: int
 
 
 # This holds all the state that gets trampolined back and forth between
@@ -1811,9 +1807,6 @@ class Runner:  # type: ignore[explicit-any]
     trio_token: TrioToken | None = None
     asyncgens: AsyncGenerators = attrs.Factory(AsyncGenerators)
 
-    # If everything goes idle for this long, we call clock._autojump()
-    # clock_autojump_threshold: float = inf
-
     # Guest mode stuff
     is_guest: bool = False
     guest_tick_scheduled: bool = False
@@ -1864,7 +1857,6 @@ class Runner:  # type: ignore[explicit-any]
             seconds_to_next_deadline=seconds_to_next_deadline,
             io_statistics=self.io_manager.statistics(),
             run_sync_soon_queue_size=self.entry_queue.size(),
-            idle_waiters=len(self.waiting_for_idle),
         )
 
     @_public
@@ -2744,21 +2736,21 @@ def unrolled_run(
                 timeout: float = 0
             else:
                 deadline = runner.deadlines.next_deadline()
-                timeout = runner.clock.deadline_to_sleep_time(deadline)
+                # The clock is told about wait_all_tasks_blocked waiters
+                # because they wake without it having to move (see below), so
+                # a virtual clock must not skip time past them.
+                timeout = runner.clock.deadline_to_sleep_time(
+                    deadline,
+                    have_idle_waiters=bool(runner.waiting_for_idle),
+                )
             timeout = min(max(0, timeout), _MAX_TIMEOUT)
 
-            idle_primed = None
+            idle_primed = False
             if runner.waiting_for_idle:
                 cushion, _ = runner.waiting_for_idle.keys()[0]
                 if cushion < timeout:
                     timeout = cushion
-                    idle_primed = IdlePrimedTypes.WAITING_FOR_IDLE
-            # We use 'elif' here because if there are tasks in
-            # wait_all_tasks_blocked, then those tasks will wake up without
-            # jumping the clock, so we don't need to autojump.
-            # elif runner.clock_autojump_threshold < timeout:
-            #     timeout = runner.clock_autojump_threshold
-            #     idle_primed = IdlePrimedTypes.AUTOJUMP_CLOCK
+                    idle_primed = True
 
             if "before_io_wait" in runner.instruments:
                 runner.instruments.call("before_io_wait", timeout)
@@ -2771,23 +2763,31 @@ def unrolled_run(
             if "after_io_wait" in runner.instruments:
                 runner.instruments.call("after_io_wait", timeout)
 
-            runner.clock.propagate(timeout)
+            # Report the wait's outcome to the clock. This is how a virtual
+            # clock learns that the run went idle: it shortened its answer in
+            # deadline_to_sleep_time on purpose, and a shortened wait that
+            # produced nothing proves that no amount of further real waiting
+            # would wake anyone.
+            runner.clock.wait_has_ended(
+                saw_events=bool(events),
+                anything_runnable=bool(runner.runq),
+            )
 
             # Process cancellations due to deadline expiry
             now = runner.clock.current_time()
             if runner.deadlines.expire(now):
-                idle_primed = None
+                idle_primed = False
 
-            # idle_primed != None means: if the IO wait hit the timeout, and
-            # still nothing is happening, then we should start waking up
-            # wait_all_tasks_blocked tasks or autojump the clock. But there
-            # are some subtleties in defining "nothing is happening".
+            # idle_primed means: if the IO wait hit the timeout, and still
+            # nothing is happening, then we should start waking up
+            # wait_all_tasks_blocked tasks. But there are some subtleties in
+            # defining "nothing is happening".
             #
             # 'not runner.runq' means that no tasks are currently runnable.
             # 'not events' means that the last IO wait call hit its full
-            # timeout. These are very similar, and if idle_primed != None and
-            # we're running in regular mode then they always go together. But,
-            # in *guest* mode, they can happen independently, even when
+            # timeout. These are very similar, and if idle_primed and we're
+            # running in regular mode then they always go together. But, in
+            # *guest* mode, they can happen independently, even when
             # idle_primed=True:
             #
             # - runner.runq=empty and events=True: the host loop adjusted a
@@ -2799,15 +2799,14 @@ def unrolled_run(
             #   before we got here.
             #
             # So we need to check both.
-            if idle_primed is not None and not runner.runq and not events:
-                if idle_primed is IdlePrimedTypes.WAITING_FOR_IDLE:
-                    while runner.waiting_for_idle:
-                        key, task = runner.waiting_for_idle.peekitem(0)
-                        if key[0] == cushion:
-                            del runner.waiting_for_idle[key]
-                            runner.reschedule(task)
-                        else:
-                            break
+            if idle_primed and not runner.runq and not events:
+                while runner.waiting_for_idle:
+                    key, task = runner.waiting_for_idle.peekitem(0)
+                    if key[0] == cushion:
+                        del runner.waiting_for_idle[key]
+                        runner.reschedule(task)
+                    else:
+                        break
 
             # Process all runnable tasks, but only the ones that are already
             # runnable now. Anything that becomes runnable during this cycle
