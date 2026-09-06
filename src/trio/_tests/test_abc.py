@@ -3,6 +3,8 @@ from __future__ import annotations
 import attrs
 import pytest
 
+import trio
+
 from .. import abc as tabc
 from ..lowlevel import Task
 
@@ -70,3 +72,24 @@ def test_abc_generics() -> None:
     channel = SlottedChannel()
     with pytest.raises(RuntimeError):
         channel.send_nowait(None)
+
+
+async def test_AsyncResource_aexit_preserves_exception_when_aclose_cancelled() -> None:
+    class MyAR(tabc.AsyncResource):
+        async def aclose(self) -> None:
+            await trio.lowlevel.checkpoint()
+
+    # An exception from the body wins over a Cancelled raised inside aclose().
+    with trio.CancelScope() as scope:
+        with pytest.raises(ValueError, match=r"^original$"):
+            async with MyAR():
+                scope.cancel()
+                raise ValueError("original")
+        assert not scope.cancelled_caught
+
+    # With no exception from the body, the Cancelled propagates as usual.
+    with trio.CancelScope() as scope:
+        async with MyAR():
+            scope.cancel()
+        raise AssertionError("unreachable")  # pragma: no cover
+    assert scope.cancelled_caught

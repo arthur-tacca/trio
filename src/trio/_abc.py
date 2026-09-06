@@ -261,8 +261,11 @@ class AsyncResource(ABC):
           ...
 
     Entering the context manager is synchronous (not a checkpoint); exiting it
-    calls :meth:`aclose`. The default implementations of
-    ``__aenter__`` and ``__aexit__`` should be adequate for all subclasses.
+    calls :meth:`aclose`. If the ``async with`` block raised an exception and
+    :meth:`aclose` is then interrupted by a `~trio.Cancelled`, the original
+    exception is preserved rather than being masked by the cancellation (see
+    `trio.lowlevel.preserve_ambient_exception`). The default implementations
+    of ``__aenter__`` and ``__aexit__`` should be adequate for all subclasses.
 
     """
 
@@ -306,7 +309,8 @@ class AsyncResource(ABC):
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        await self.aclose()
+        with trio.lowlevel.preserve_ambient_exception(exc_value):
+            await self.aclose()
 
 
 class SendStream(AsyncResource):

@@ -1,0 +1,4 @@
+`trio.abc.AsyncResource`'s default ``__aexit__`` now uses
+`trio.lowlevel.preserve_ambient_exception`, so an exception raised inside an
+``async with`` block is no longer lost if the resource's
+:meth:`~trio.abc.AsyncResource.aclose` is interrupted by cancellation.
