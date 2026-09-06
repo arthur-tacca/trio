@@ -461,6 +461,15 @@ timeouts internally, then those will continue to work normally as
 well. This is a pretty advanced feature that most people probably
 won't use, but it's there for the rare cases where you need it.
 
+There's one more subtlety with blocking operations in cleanup handlers.
+Suppose ``await conn.send_hello_msg()`` fails with some other exception,
+say a :exc:`ConnectionResetError`, but by the time the ``finally`` block
+runs, the timeout has also expired. Then ``await conn.send_goodbye_msg()``
+raises :exc:`Cancelled`, and that :exc:`Cancelled` replaces the
+:exc:`ConnectionResetError`, which is lost. If you'd rather keep the
+original exception in cases like this, wrap the cleanup code in
+`trio.lowlevel.preserve_ambient_exception`.
+
 
 .. _cancellable-primitives:
 

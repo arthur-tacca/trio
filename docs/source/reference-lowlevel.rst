@@ -473,6 +473,18 @@ These transitions are accomplished using two function decorators:
 .. autofunction:: currently_ki_protected
 
 
+Preserving exceptions across cancelled cleanup
+==============================================
+
+Cleanup code in a ``finally:`` block or an ``__aexit__`` method often
+runs while an exception is already propagating. If that cleanup code
+performs a blocking operation and the surrounding scope has been
+cancelled, the resulting `Cancelled` exception replaces the original
+one, which is then lost. This context manager prevents that:
+
+.. autoclass:: preserve_ambient_exception(ambient=<exception being handled>)
+
+
 Sleeping and waking
 ===================
 

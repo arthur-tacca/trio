@@ -40,6 +40,7 @@ from ._core import (
     in_trio_task as in_trio_task,
     notify_closing as notify_closing,
     permanently_detach_coroutine_object as permanently_detach_coroutine_object,
+    preserve_ambient_exception as preserve_ambient_exception,
     reattach_detached_coroutine_object as reattach_detached_coroutine_object,
     remove_instrument as remove_instrument,
     remove_parking_lot_breaker as remove_parking_lot_breaker,

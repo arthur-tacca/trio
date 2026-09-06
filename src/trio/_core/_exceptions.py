@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+import sys
 from functools import partial
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
@@ -7,8 +9,12 @@ import attrs
 
 from trio._util import NoPublicConstructor, final
 
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
+
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from types import TracebackType
 
     from typing_extensions import Self
 
@@ -167,3 +173,98 @@ class EndOfChannel(Exception):
     This is analogous to an "end-of-file" condition, but for channels.
 
     """
+
+
+class _Auto(enum.Enum):
+    AUTO = enum.auto()
+
+
+_AUTO = _Auto.AUTO
+
+
+@final
+class preserve_ambient_exception:
+    """A context manager that stops a `Cancelled` raised in its body from
+    masking an exception that was already propagating.
+
+    Use it to surround the contents of a ``finally:`` block, or the body of
+    an ``__exit__`` or ``__aexit__`` method, when that cleanup code contains
+    :ref:`checkpoints <checkpoints>`. If the enclosing scope has been
+    cancelled, then those checkpoints will raise `Cancelled`, and normally
+    that new `Cancelled` would replace whatever exception the ``finally:``
+    block or ``__aexit__`` method was invoked to handle. In many cases the
+    original exception is the more interesting one, and it would otherwise
+    be lost.
+
+    When entered, this context manager records the "ambient" exception: the
+    exception currently being handled, as reported by :func:`sys.exc_info`.
+    If the body then raises `Cancelled` (or an :exc:`BaseExceptionGroup`
+    containing nothing but `Cancelled` exceptions), and there was an ambient
+    exception, the `Cancelled` is suppressed so that the ambient exception
+    continues to propagate. In every other case the body's exception
+    propagates unchanged.
+
+    For example, this async context manager does some asynchronous cleanup
+    and wants the exception from its body to win over any cancellation that
+    interrupts the cleanup::
+
+       @asynccontextmanager
+       async def my_cm():
+           try:
+               yield
+           finally:
+               with trio.lowlevel.preserve_ambient_exception():
+                   await cleanup()
+
+    :class:`trio.abc.AsyncResource` uses this in its default ``__aexit__``
+    implementation, passing the ``exc_value`` argument explicitly.
+
+    Args:
+      ambient: The exception that is being handled. If omitted, it is looked
+          up automatically with :func:`sys.exc_info` when the context manager
+          is entered. Pass ``None`` to indicate that no exception is being
+          handled, in which case the context manager does nothing.
+
+    .. note::
+
+       Suppressing the `Cancelled` means that the cancel scope it belongs to
+       never sees it, so that scope's
+       :attr:`~trio.CancelScope.cancelled_caught` won't be set by it. The
+       scope remains cancelled, so the next checkpoint will raise `Cancelled`
+       again. If the ambient exception is caught somewhere between the
+       cleanup code and the cancel scope, the cancellation is therefore
+       delayed until that next checkpoint rather than lost.
+
+    """
+
+    __slots__ = ("_ambient", "_captured")
+
+    def __init__(
+        self, ambient: BaseException | Literal[_Auto.AUTO] | None = _AUTO
+    ) -> None:
+        self._ambient = ambient
+        self._captured: BaseException | None = None
+
+    def __enter__(self) -> Self:
+        if self._ambient is _AUTO:
+            self._captured = sys.exc_info()[1]
+        else:
+            self._captured = self._ambient
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        captured, self._captured = self._captured, None
+        if exc_value is None or captured is None:
+            return False
+        if isinstance(exc_value, BaseExceptionGroup):
+            # The group is suppressed only if it contains nothing but Cancelled
+            # exceptions (possibly nested inside further groups). Note that
+            # BaseExceptionGroup.subgroup()/split() with a predicate would also
+            # test the group nodes themselves, so we match by type instead.
+            return exc_value.split(Cancelled)[1] is None
+        return isinstance(exc_value, Cancelled)

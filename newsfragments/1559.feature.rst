@@ -1,0 +1,4 @@
+Added `trio.lowlevel.preserve_ambient_exception`, a context manager for use
+around the contents of a ``finally:`` block or the body of an ``__aexit__``
+method. It stops a `trio.Cancelled` raised by cleanup code from masking the
+exception that the cleanup code was invoked to handle.

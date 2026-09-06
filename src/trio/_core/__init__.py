@@ -17,6 +17,7 @@ from ._exceptions import (
     RunFinishedError,
     TrioInternalError,
     WouldBlock,
+    preserve_ambient_exception,
 )
 from ._ki import currently_ki_protected, disable_ki_protection, enable_ki_protection
 from ._local import RunVar, RunVarToken
