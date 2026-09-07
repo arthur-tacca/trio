@@ -24,9 +24,10 @@ def test_mock_clock() -> None:
     with pytest.raises(ValueError, match=r"^time can't go backwards$"):
         c.jump(-1)
     assert c.current_time() == 1.2
-    assert c.deadline_to_sleep_time(1.1) == 0
-    assert c.deadline_to_sleep_time(1.2) == 0
-    assert c.deadline_to_sleep_time(1.3) > 999999
+    # relative deadlines now, i.e. absolute 1.1 / 1.2 / 1.3 with now == 1.2
+    assert c.relative_deadline_to_sleep_time(-0.1) == 0
+    assert c.relative_deadline_to_sleep_time(0) == 0
+    assert c.relative_deadline_to_sleep_time(0.1) > 999999
 
     with pytest.raises(ValueError, match=r"^rate must be >= 0$"):
         c.rate = -1
@@ -36,15 +37,17 @@ def test_mock_clock() -> None:
     assert c.current_time() == 1.2
     REAL_NOW += 1
     assert c.current_time() == 3.2
-    assert c.deadline_to_sleep_time(3.1) == 0
-    assert c.deadline_to_sleep_time(3.2) == 0
-    assert c.deadline_to_sleep_time(4.2) == 0.5
+    # absolute 3.1 / 3.2 / 4.2 with now == 3.2, at rate 2
+    assert c.relative_deadline_to_sleep_time(-0.1) == 0
+    assert c.relative_deadline_to_sleep_time(0) == 0
+    assert c.relative_deadline_to_sleep_time(1.0) == 0.5
 
     c.rate = 0.5
     assert c.current_time() == 3.2
-    assert c.deadline_to_sleep_time(3.1) == 0
-    assert c.deadline_to_sleep_time(3.2) == 0
-    assert c.deadline_to_sleep_time(4.2) == 2.0
+    # same, at rate 0.5
+    assert c.relative_deadline_to_sleep_time(-0.1) == 0
+    assert c.relative_deadline_to_sleep_time(0) == 0
+    assert c.relative_deadline_to_sleep_time(1.0) == 2.0
 
     c.jump(0.8)
     assert c.current_time() == 4.0
@@ -182,11 +185,13 @@ def test_autojump_direct() -> None:
     # The public hook the run loop drives autojump through: check its
     # contract without a run.
     c = MockClock(autojump_threshold=1.0)
-    c.autojump(10.0)  # jump exactly to the deadline
+    c.autojump(10.0)  # jump exactly onto a deadline 10 seconds ahead
     assert c.current_time() == 10.0
     c.autojump(inf)  # nothing scheduled: nowhere to go
     assert c.current_time() == 10.0
-    c.autojump(5.0)  # deadline in the past: time can't go backwards
+    c.autojump(-0.1)  # deadline already passed: time can't go backwards
+    assert c.current_time() == 10.0
+    c.autojump(0)  # deadline due right now: nothing to skip
     assert c.current_time() == 10.0
 
 
@@ -204,14 +209,17 @@ def test_custom_clock_wrapping_mock_clock() -> None:
         def current_time(self) -> float:
             return self._mock.current_time()
 
-        def deadline_to_sleep_time(self, deadline: float) -> float:
-            return self._mock.deadline_to_sleep_time(deadline)
+        def relative_deadline_to_sleep_time(
+            self,
+            relative_deadline: float,
+        ) -> float:
+            return self._mock.relative_deadline_to_sleep_time(relative_deadline)
 
         def get_autojump_threshold(self) -> float:
             return self._mock.get_autojump_threshold()
 
-        def autojump(self, next_deadline: float) -> None:
-            self._mock.autojump(next_deadline)
+        def autojump(self, relative_deadline: float) -> None:
+            self._mock.autojump(relative_deadline)
 
     record: list[str] = []
 
@@ -249,16 +257,19 @@ def test_custom_clock_from_scratch() -> None:
         def current_time(self) -> float:
             return self._now
 
-        def deadline_to_sleep_time(self, deadline: float) -> float:
+        def relative_deadline_to_sleep_time(
+            self,
+            relative_deadline: float,
+        ) -> float:
             # frozen: no amount of real waiting reaches a future deadline
-            return 0 if deadline <= self._now else 999999999
+            return 0 if relative_deadline <= 0 else 999999999
 
         def get_autojump_threshold(self) -> float:
             return 0.0
 
-        def autojump(self, next_deadline: float) -> None:
-            if next_deadline < inf:
-                self._now = max(self._now, next_deadline)
+        def autojump(self, relative_deadline: float) -> None:
+            if 0 < relative_deadline < inf:
+                self._now += relative_deadline
 
     clock = FrozenClock()
 
@@ -271,3 +282,42 @@ def test_custom_clock_from_scratch() -> None:
     assert clock.current_time() == 15
     # 15 virtual seconds in (much less than) 15 real ones
     assert time.perf_counter() - start < 10
+
+
+def test_offset_clock_delegates_without_rebasing() -> None:
+    # A clock that reports absolute wall-clock-style dates by adding an epoch
+    # offset to an inner MockClock. Because the run loop hands over a
+    # *relative* deadline, every method but current_time() is a pure
+    # forward -- there is no origin to translate, so there is no origin to
+    # get wrong. (With absolute deadlines this clock had to subtract its
+    # offset in two places, and forgetting either silently corrupted time.)
+    EPOCH = 1_700_000_000.0
+
+    class OffsetClock(Clock):
+        def __init__(self) -> None:
+            self._mock = MockClock(autojump_threshold=0)
+
+        def start_clock(self) -> None:
+            self._mock.start_clock()
+
+        def current_time(self) -> float:
+            return EPOCH + self._mock.current_time()
+
+        def relative_deadline_to_sleep_time(
+            self,
+            relative_deadline: float,
+        ) -> float:
+            return self._mock.relative_deadline_to_sleep_time(relative_deadline)
+
+        def get_autojump_threshold(self) -> float:
+            return self._mock.get_autojump_threshold()
+
+        def autojump(self, relative_deadline: float) -> None:
+            return self._mock.autojump(relative_deadline)
+
+    async def main() -> None:
+        assert _core.current_time() == EPOCH
+        await sleep(3600)
+        assert _core.current_time() == EPOCH + 3600
+
+    _core.run(main, clock=OffsetClock())

@@ -43,26 +43,34 @@ class Clock(ABC):
         """
 
     @abstractmethod
-    def deadline_to_sleep_time(self, deadline: float) -> float:
-        """Compute the real time until the given deadline.
+    def relative_deadline_to_sleep_time(self, relative_deadline: float) -> float:
+        """Convert a span of this clock's time into real time.
 
         This is called before we enter a system-specific wait function like
         :func:`select.select`, to get the timeout to pass.
 
-        For a clock using wall-time, this should be something like::
+        For a clock that runs at wall-clock rate this is just::
 
-           return deadline - self.current_time()
+           return relative_deadline
 
         but of course it may be different if you're implementing some kind of
-        virtual clock.
+        virtual clock -- a clock whose time is frozen, for instance, can
+        return :data:`math.inf` to say that no amount of real waiting will
+        ever get there.
+
+        Returning *less* than the true answer is always safe: the run loop
+        simply wakes early, finds nothing to do, and asks again. Returning
+        more risks missing the deadline.
 
         Args:
-            deadline (float): The absolute time of the next deadline,
-                according to this clock.
+            relative_deadline (float): How far in the future the next
+                deadline is, in this clock's own time. May be negative (the
+                deadline has already passed) or :data:`math.inf` (there is no
+                deadline).
 
         Returns:
-            float: The number of real seconds to sleep until the given
-            deadline. May be :data:`math.inf`.
+            float: The number of real seconds to sleep. May be
+            :data:`math.inf`.
 
         """
 
@@ -85,7 +93,7 @@ class Clock(ABC):
         """
         return inf
 
-    def autojump(self, next_deadline: float) -> None:
+    def autojump(self, relative_deadline: float) -> None:
         """Jump this clock forward, because the run loop has proved the run
         idle for a full :meth:`get_autojump_threshold`.
 
@@ -93,8 +101,13 @@ class Clock(ABC):
         nothing: no events arrived, no deadline expired, and no task is
         runnable. Nothing in the run can make progress until time passes.
 
-        ``next_deadline`` is the earliest scheduled deadline, or
-        :data:`math.inf` if there is none.
+        ``relative_deadline`` is how far in the future the earliest
+        scheduled deadline is, in this clock's own time -- so jumping
+        forward by exactly that much lands on it. It is
+        :data:`math.inf` if nothing is scheduled. Like
+        :meth:`relative_deadline_to_sleep_time`, taking a span rather than
+        an absolute time means a clock that reports time on a shifted
+        origin (e.g. one wrapping another clock) has nothing to translate.
 
         If :meth:`get_autojump_threshold` has the default implementation
         (returning :data:`math.inf`), this is never called, so a clock that

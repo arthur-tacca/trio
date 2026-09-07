@@ -184,7 +184,10 @@ def test_guest_is_initialized_when_start_returns() -> None:
         def current_time(self) -> float:
             raise NotImplementedError()
 
-        def deadline_to_sleep_time(self, deadline: float) -> float:
+        def relative_deadline_to_sleep_time(
+            self,
+            relative_deadline: float,
+        ) -> float:
             raise NotImplementedError()
 
     def after_start_never_runs() -> None:  # pragma: no cover

@@ -109,13 +109,12 @@ class MockClock(Clock):
         return self._autojump_threshold
 
     # Invoked by the run loop once it has proved the run idle for a full
-    # get_autojump_threshold(). Identical to the old private _autojump(),
-    # except that the next deadline is handed to us rather than fetched from
-    # the active run via _core.current_statistics().
-    def autojump(self, next_deadline: float) -> None:
-        jump = next_deadline - self.current_time()
-        if 0 < jump < inf:
-            self.jump(jump)
+    # get_autojump_threshold(). Equivalent to the old private _autojump(),
+    # except that the distance to the next deadline is handed to us rather
+    # than fetched from the active run via _core.current_statistics().
+    def autojump(self, relative_deadline: float) -> None:
+        if 0 < relative_deadline < inf:
+            self.jump(relative_deadline)
 
     def _real_to_virtual(self, real: float) -> float:
         real_offset = real - self._real_base
@@ -130,12 +129,11 @@ class MockClock(Clock):
     def current_time(self) -> float:
         return self._real_to_virtual(self._real_clock())
 
-    def deadline_to_sleep_time(self, deadline: float) -> float:
-        virtual_timeout = deadline - self.current_time()
-        if virtual_timeout <= 0:
+    def relative_deadline_to_sleep_time(self, relative_deadline: float) -> float:
+        if relative_deadline <= 0:
             return 0
         elif self._rate > 0:
-            return virtual_timeout / self._rate
+            return relative_deadline / self._rate
         else:
             return 999999999
 

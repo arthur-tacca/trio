@@ -204,8 +204,8 @@ class SystemClock(Clock):
     def current_time(self) -> float:
         return self.offset + perf_counter()
 
-    def deadline_to_sleep_time(self, deadline: float) -> float:
-        return deadline - self.current_time()
+    def relative_deadline_to_sleep_time(self, relative_deadline: float) -> float:
+        return relative_deadline
 
 
 class IdlePrimedTypes(enum.Enum):
@@ -2736,8 +2736,12 @@ def unrolled_run(
             if runner.runq:
                 timeout: float = 0
             else:
-                deadline = runner.deadlines.next_deadline()
-                timeout = runner.clock.deadline_to_sleep_time(deadline)
+                relative_deadline = (
+                    runner.deadlines.next_deadline() - runner.clock.current_time()
+                )
+                timeout = runner.clock.relative_deadline_to_sleep_time(
+                    relative_deadline,
+                )
             timeout = min(max(0, timeout), _MAX_TIMEOUT)
 
             idle_primed = None
@@ -2801,7 +2805,9 @@ def unrolled_run(
                             break
                 else:
                     assert idle_primed is IdlePrimedTypes.AUTOJUMP_CLOCK
-                    runner.clock.autojump(runner.deadlines.next_deadline())
+                    runner.clock.autojump(
+                        runner.deadlines.next_deadline() - runner.clock.current_time(),
+                    )
 
             # Process all runnable tasks, but only the ones that are already
             # runnable now. Anything that becomes runnable during this cycle
