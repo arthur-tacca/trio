@@ -5,7 +5,7 @@ from typing import NoReturn
 
 import pytest
 
-from ..testing import MockClock, trio_test
+from ..testing import TestingClock, trio_test
 
 RUN_SLOW = True
 SKIP_OPTIONAL_IMPORTS = False
@@ -28,13 +28,13 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture
-def mock_clock() -> MockClock:
-    return MockClock()
+def testing_clock() -> TestingClock:
+    return TestingClock()
 
 
 @pytest.fixture
-def autojump_clock() -> MockClock:
-    return MockClock(autojump_threshold=0)
+def autojump_clock() -> TestingClock:
+    return TestingClock(autojump_threshold=0)
 
 
 # FIXME: split off into a package (or just make part of Trio's public

@@ -51,7 +51,9 @@ async def test_wait_all_tasks_blocked() -> None:
     assert record == ["ok"]
 
 
-async def test_wait_all_tasks_blocked_with_timeouts(mock_clock: MockClock) -> None:
+async def test_wait_all_tasks_blocked_with_timeouts(
+    testing_clock: TestingClock,
+) -> None:
     record = []
 
     async def timeout_task() -> None:
@@ -63,7 +65,7 @@ async def test_wait_all_tasks_blocked_with_timeouts(mock_clock: MockClock) -> No
         nursery.start_soon(timeout_task)
         await wait_all_tasks_blocked()
         assert record == ["tt start"]
-        mock_clock.jump(10)
+        testing_clock.jump(10)
         await wait_all_tasks_blocked()
         assert record == ["tt start", "tt finished"]
 
@@ -671,12 +673,12 @@ async def test_open_stream_to_socket_listener() -> None:
 def test_trio_test() -> None:
     async def busy_kitchen(
         *,
-        mock_clock: object,
+        testing_clock: object,
         autojump_clock: object,
     ) -> None: ...  # pragma: no cover
 
     with pytest.raises(ValueError, match=r"^too many clocks spoil the broth!$"):
         trio_test(busy_kitchen)(
-            mock_clock=MockClock(),
-            autojump_clock=MockClock(autojump_threshold=0),
+            testing_clock=TestingClock(),
+            autojump_clock=TestingClock(autojump_threshold=0),
         )

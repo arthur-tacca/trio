@@ -34,7 +34,7 @@ async def foo_overloaded(arg: int | str) -> int | str:
 v = trio.run(
     sleep_sort,
     (1, 3, 5, 2, 4),
-    clock=trio.testing.MockClock(autojump_threshold=0),
+    clock=trio.testing.TestingClock(autojump_threshold=0),
 )
 assert_type(v, "list[float]")
 trio.run(sleep_sort, ["hi", "there"])  # type: ignore[arg-type]

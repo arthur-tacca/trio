@@ -12,7 +12,7 @@ from trio import Nursery, StapledStream, TaskStatus
 from trio.testing import (
     MemoryReceiveStream,
     MemorySendStream,
-    MockClock,
+    TestingClock,
     memory_stream_pair,
     wait_all_tasks_blocked,
 )
@@ -126,7 +126,7 @@ async def test_serve_listeners_accept_unrecognized_error() -> None:
 
 
 async def test_serve_listeners_accept_capacity_error(
-    autojump_clock: MockClock,
+    autojump_clock: TestingClock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     listener = MemoryListener()
@@ -149,7 +149,7 @@ async def test_serve_listeners_accept_capacity_error(
         assert record.exc_info[1].errno == errno.EMFILE
 
 
-async def test_serve_listeners_connection_nursery(autojump_clock: MockClock) -> None:
+async def test_serve_listeners_connection_nursery(autojump_clock: TestingClock) -> None:
     listener = MemoryListener()
 
     async def handler(stream: Stream) -> None:

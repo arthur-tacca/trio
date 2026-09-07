@@ -139,7 +139,7 @@ async def test_smoke(
 
 @slow
 async def test_handshake_over_terrible_network(
-    autojump_clock: trio.testing.MockClock,
+    autojump_clock: trio.testing.TestingClock,
     server_ctx: SSL.Context,
 ) -> None:
     HANDSHAKES = 100

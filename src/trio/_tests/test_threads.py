@@ -17,6 +17,8 @@ from typing import (
 import pytest
 import sniffio
 
+from trio._core import TestingClock
+
 from .. import (
     CancelScope,
     CapacityLimiter,
@@ -421,7 +423,7 @@ def test_run_in_worker_thread_abandoned(
             await wait_all_tasks_blocked()
             nursery.cancel_scope.cancel()
 
-    _core.run(main)
+    _core.run(main, clock=TestingClock(rate=1.0))
 
     q1.put(None)
     # This makes sure:

@@ -2,7 +2,8 @@
 
 from .. import _deprecate as _deprecate
 from .._core import (
-    MockClock as MockClock,
+    TestingClock as TestingClock,
+    TestingClock as _TestingClock,
     wait_all_tasks_blocked as wait_all_tasks_blocked,
 )
 from .._threads import (
@@ -50,6 +51,12 @@ _deprecate.deprecate_attributes(
             version="0.33.0",
             issue=3326,
             instead="See https://docs.pytest.org/en/stable/reference/reference.html#pytest.RaisesExc",
+        ),
+        "MockClock": _deprecate.DeprecatedAttribute(
+            _TestingClock,
+            version="0.34.0",
+            issue=3369,
+            instead="trio.testing.TestingClock",
         ),
     },
 )

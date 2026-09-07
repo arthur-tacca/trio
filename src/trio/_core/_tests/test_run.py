@@ -23,6 +23,8 @@ import outcome
 import pytest
 import sniffio
 
+from trio._core import TestingClock
+
 from ... import _core
 from ..._threads import to_thread_run_sync
 from ..._timeouts import fail_after, sleep
@@ -270,16 +272,18 @@ async def test_current_time() -> None:
     assert t1 < t2
 
 
-async def test_current_time_with_mock_clock(mock_clock: _core.MockClock) -> None:
-    start = mock_clock.current_time()
-    assert mock_clock.current_time() == _core.current_time()
-    assert mock_clock.current_time() == _core.current_time()
-    mock_clock.jump(3.15)
-    assert start + 3.15 == mock_clock.current_time() == _core.current_time()
+async def test_current_time_with_testing_clock(
+    testing_clock: _core.TestingClock,
+) -> None:
+    start = testing_clock.current_time()
+    assert testing_clock.current_time() == _core.current_time()
+    assert testing_clock.current_time() == _core.current_time()
+    testing_clock.jump(3.15)
+    assert start + 3.15 == testing_clock.current_time() == _core.current_time()
 
 
-async def test_current_clock(mock_clock: _core.MockClock) -> None:
-    assert mock_clock is _core.current_clock()
+async def test_current_clock(testing_clock: _core.TestingClock) -> None:
+    assert testing_clock is _core.current_clock()
 
 
 async def test_current_task() -> None:
@@ -304,7 +308,7 @@ def test_out_of_context() -> None:
         _core.current_time()
 
 
-async def test_current_statistics(mock_clock: _core.MockClock) -> None:
+async def test_current_statistics(testing_clock: _core.TestingClock) -> None:
     # Make sure all the early startup stuff has settled down
     await wait_all_tasks_blocked()
 
@@ -354,7 +358,7 @@ async def test_current_statistics(mock_clock: _core.MockClock) -> None:
     assert stats.seconds_to_next_deadline == inf
 
 
-async def test_cancel_scope_repr(mock_clock: _core.MockClock) -> None:
+async def test_cancel_scope_repr(testing_clock: _core.TestingClock) -> None:
     scope = _core.CancelScope()
     assert "unbound" in repr(scope)
     with scope:
@@ -603,14 +607,14 @@ async def test_cancel_shield_abort() -> None:
                 assert record == ["sleeping", "cancelled"]
 
 
-async def test_basic_timeout(mock_clock: _core.MockClock) -> None:
+async def test_basic_timeout(testing_clock: _core.TestingClock) -> None:
     start = _core.current_time()
     with _core.CancelScope() as scope:
         assert scope.deadline == inf
         scope.deadline = start + 1
         assert scope.deadline == start + 1
     assert not scope.cancel_called
-    mock_clock.jump(2)
+    testing_clock.jump(2)
     await _core.checkpoint()
     await _core.checkpoint()
     await _core.checkpoint()
@@ -618,7 +622,7 @@ async def test_basic_timeout(mock_clock: _core.MockClock) -> None:
 
     start = _core.current_time()
     with _core.CancelScope(deadline=start + 1) as scope:
-        mock_clock.jump(2)
+        testing_clock.jump(2)
         await sleep_forever()
     # But then the scope swallowed the exception... but we can still see it
     # here:
@@ -631,7 +635,7 @@ async def test_basic_timeout(mock_clock: _core.MockClock) -> None:
         await _core.checkpoint()
         scope.deadline = start + 10
         await _core.checkpoint()
-        mock_clock.jump(5)
+        testing_clock.jump(5)
         await _core.checkpoint()
         scope.deadline = start + 1
         with pytest.raises(_core.Cancelled):
@@ -898,9 +902,9 @@ async def test_asyncexitstack_nursery_misnest() -> None:
     # special logic of abandoned nurseries to avoid nasty internal errors that masks
     # the RuntimeError.
     @asynccontextmanager
-    async def asynccontextmanager_that_creates_a_nursery_internally() -> (
-        AsyncGenerator[None]
-    ):
+    async def asynccontextmanager_that_creates_a_nursery_internally() -> AsyncGenerator[
+        None
+    ]:
         async with _core.open_nursery() as nursery:
             await nursery.start(started_sleeper)
             nursery.start_soon(unstarted_task)
@@ -1182,10 +1186,12 @@ def test_system_task_crash_KeyboardInterrupt() -> None:
 # 4) this task has timed out
 # 5) ...but it's on the run queue, so the timeout is queued to be delivered
 #    the next time that it's blocked.
-async def test_yield_briefly_checks_for_timeout(mock_clock: _core.MockClock) -> None:
+async def test_yield_briefly_checks_for_timeout(
+    testing_clock: _core.TestingClock,
+) -> None:
     with _core.CancelScope(deadline=_core.current_time() + 5):
         await _core.checkpoint()
-        mock_clock.jump(10)
+        testing_clock.jump(10)
         with pytest.raises(_core.Cancelled):
             await _core.checkpoint()
 
@@ -1381,8 +1387,10 @@ async def test_exception_chaining_after_throw_to_inner() -> None:
         pytest.RaisesExc(
             ValueError,
             match="^Unique Text$",
-            check=lambda e: isinstance(e.__context__, IndexError)
-            and isinstance(e.__context__.__context__, KeyError),
+            check=lambda e: (
+                isinstance(e.__context__, IndexError)
+                and isinstance(e.__context__.__context__, KeyError)
+            ),
         ),
     ):
         async with _core.open_nursery() as nursery:
@@ -1821,7 +1829,7 @@ async def test_spawn_name() -> None:
     await check(_core.spawn_system_task)
 
 
-async def test_current_effective_deadline(mock_clock: _core.MockClock) -> None:
+async def test_current_effective_deadline(testing_clock: _core.TestingClock) -> None:
     assert _core.current_effective_deadline() == inf
 
     with _core.CancelScope(deadline=5) as scope1:
@@ -1958,7 +1966,7 @@ async def test_trivial_yields() -> None:
                 raise KeyError
 
 
-async def test_nursery_start(autojump_clock: _core.MockClock) -> None:
+async def test_nursery_start(autojump_clock: _core.TestingClock) -> None:
     async def no_args() -> None:  # pragma: no cover
         pass
 
@@ -2144,7 +2152,7 @@ async def test_nursery_start_with_cancelled_nursery() -> None:
 
 
 async def test_nursery_start_keeps_nursery_open(
-    autojump_clock: _core.MockClock,
+    autojump_clock: _core.TestingClock,
 ) -> None:
     async def sleep_a_bit(
         task_status: _core.TaskStatus[None] = _core.TASK_STATUS_IGNORED,
@@ -2338,7 +2346,7 @@ def test_system_task_contexts() -> None:
             _core.spawn_system_task(system_task)
             await wait_all_tasks_blocked()
 
-    _core.run(inner)
+    _core.run(inner, clock=TestingClock(rate=1.0))
 
 
 async def test_Nursery_init() -> None:
@@ -2812,7 +2820,7 @@ async def test_nursery_collapse(strict: bool | None) -> None:
     # mypy requires explicit type for conditional expression
     maybe_wrapped_runtime_error: (
         type[RuntimeError] | pytest.RaisesGroup[RuntimeError]
-    ) = (RuntimeError if strict is False else pytest.RaisesGroup(RuntimeError))
+    ) = RuntimeError if strict is False else pytest.RaisesGroup(RuntimeError)
 
     with pytest.RaisesGroup(RuntimeError, maybe_wrapped_runtime_error):
         async with _core.open_nursery() as nursery:
@@ -2927,8 +2935,10 @@ async def test_start_exception_preserves_cause_and_context() -> None:
     with pytest.RaisesGroup(
         pytest.RaisesExc(
             ValueError,
-            check=lambda exc: isinstance(exc.__cause__, SyntaxError)
-            and isinstance(exc.__context__, TypeError),
+            check=lambda exc: (
+                isinstance(exc.__cause__, SyntaxError)
+                and isinstance(exc.__context__, TypeError)
+            ),
         ),
     ):
         async with _core.open_nursery() as nursery:

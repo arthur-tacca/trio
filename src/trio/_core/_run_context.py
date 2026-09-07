@@ -13,3 +13,17 @@ class RunContext(threading.local):
 
 
 GLOBAL_RUN_CONTEXT: Final = RunContext()
+
+
+def current_task() -> Task:
+    """Return the :class:`Task` object representing the current task.
+
+    Returns:
+      Task: the :class:`Task` that called :func:`current_task`.
+
+    """
+
+    try:
+        return GLOBAL_RUN_CONTEXT.task
+    except AttributeError:
+        raise RuntimeError("must be called from async context") from None

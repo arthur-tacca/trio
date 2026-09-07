@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, NoReturn
 
 import pytest
 
+from trio._core import TestingClock
+
 from ... import _core
 from .tutil import gc_collect_harder, restore_unraisablehook
 
@@ -87,7 +89,7 @@ def test_asyncgen_basics() -> None:
         assert await saved[-1].asend(None) == 42
         assert collected == []
 
-    _core.run(async_main)
+    _core.run(async_main, clock=TestingClock(rate=1.0))
     assert collected.pop() == "outlived run"
     for agen in saved:
         assert isinstance(agen, AsyncGeneratorType)
@@ -337,7 +339,7 @@ def test_delegation_to_existing_hooks() -> None:
         old_hooks = sys.get_asyncgen_hooks()
         sys.set_asyncgen_hooks(my_firstiter, my_finalizer)
         try:
-            _core.run(async_main)
+            _core.run(async_main, clock=TestingClock(rate=1.0))
         finally:
             assert sys.get_asyncgen_hooks() == (my_firstiter, my_finalizer)
             sys.set_asyncgen_hooks(*old_hooks)

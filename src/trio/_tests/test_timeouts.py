@@ -209,11 +209,11 @@ async def test_timeouts_raise_value_error() -> None:
                 pass  # pragma: no cover
 
 
-async def test_timeout_deadline_on_entry(mock_clock: _core.MockClock) -> None:
+async def test_timeout_deadline_on_entry(testing_clock: _core.TestingClock) -> None:
     rcs = move_on_after(5)
     assert rcs.relative_deadline == 5
 
-    mock_clock.jump(3)
+    testing_clock.jump(3)
     start = _core.current_time()
     with rcs as cs:
         assert cs.is_relative is None
@@ -235,7 +235,7 @@ async def test_timeout_deadline_on_entry(mock_clock: _core.MockClock) -> None:
     rcs.shield = True
     assert rcs.shield is True
 
-    mock_clock.jump(3)
+    testing_clock.jump(3)
     start = _core.current_time()
     with rcs as cs:
         assert cs.deadline == start + 5

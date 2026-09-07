@@ -35,7 +35,7 @@ from .. import (
 )
 from .._core._tests.tutil import skip_if_fbsd_pipes_broken, slow
 from ..lowlevel import open_process
-from ..testing import MockClock, assert_no_checkpoints, wait_all_tasks_blocked
+from ..testing import TestingClock, assert_no_checkpoints, wait_all_tasks_blocked
 
 if TYPE_CHECKING:
     from types import FrameType
@@ -664,7 +664,7 @@ def test_bad_deliver_cancel() -> None:
     with pytest.RaisesGroup(
         pytest.RaisesGroup(pytest.RaisesExc(ValueError, match="^foo$"))
     ):
-        _core.run(do_stuff, strict_exception_groups=True)
+        _core.run(do_stuff, strict_exception_groups=True, clock=TestingClock(rate=1.0))
 
 
 async def test_warn_on_failed_cancel_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -685,7 +685,7 @@ async def test_warn_on_failed_cancel_terminate(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.skipif(not posix, reason="posix only")
 async def test_warn_on_cancel_SIGKILL_escalation(
-    autojump_clock: MockClock,
+    autojump_clock: TestingClock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Process, "terminate", lambda *args: None)

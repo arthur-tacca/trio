@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import enum
 import functools
 import gc
 import itertools
@@ -28,7 +27,6 @@ import attrs
 import outcome
 from outcome import Error, Outcome, Value, capture
 from sniffio import thread_local as sniffio_library
-from sortedcontainers import SortedDict
 
 from .. import _core
 from .._abc import Clock, Instrument
@@ -46,7 +44,10 @@ from ._exceptions import (
 from ._instrumentation import Instruments
 from ._ki import KIManager, enable_ki_protection
 from ._parking_lot import GLOBAL_PARKING_LOT_BREAKER
-from ._run_context import GLOBAL_RUN_CONTEXT as GLOBAL_RUN_CONTEXT
+from ._run_context import (
+    GLOBAL_RUN_CONTEXT as GLOBAL_RUN_CONTEXT,
+    current_task as current_task,
+)
 from ._thread_cache import start_thread_soon
 from ._traps import (
     Abort,
@@ -189,14 +190,11 @@ CONTEXT_RUN_TB_FRAMES: Final = _count_context_run_tb_frames()
 
 
 @attrs.frozen
-class SystemClock(Clock):
+class RealClock(Clock):
     # Add a large random offset to our clock to ensure that if people
     # accidentally call time.perf_counter() directly or start comparing clocks
     # between different runs, then they'll notice the bug quickly:
     offset: float = attrs.Factory(lambda: _r.uniform(10000, 200000))
-
-    def start_clock(self) -> None:
-        pass
 
     # In cPython 3, on every platform except Windows, perf_counter is
     # exactly the same as time.monotonic; and on Windows, it uses
@@ -204,13 +202,8 @@ class SystemClock(Clock):
     def current_time(self) -> float:
         return self.offset + perf_counter()
 
-    def deadline_to_sleep_time(self, deadline: float) -> float:
-        return deadline - self.current_time()
-
-
-class IdlePrimedTypes(enum.Enum):
-    WAITING_FOR_IDLE = 1
-    AUTOJUMP_CLOCK = 2
+    # Runs at wall-clock rate, so the base class's before_io_wait and
+    # after_io_wait defaults are exactly right.
 
 
 ################################################################
@@ -1808,9 +1801,6 @@ class Runner:  # type: ignore[explicit-any]
     trio_token: TrioToken | None = None
     asyncgens: AsyncGenerators = attrs.Factory(AsyncGenerators)
 
-    # If everything goes idle for this long, we call clock._autojump()
-    clock_autojump_threshold: float = inf
-
     # Guest mode stuff
     is_guest: bool = False
     guest_tick_scheduled: bool = False
@@ -2242,79 +2232,6 @@ class Runner:  # type: ignore[explicit-any]
     # Quiescing
     ################
 
-    # sortedcontainers doesn't have types, and is reportedly very hard to type:
-    # https://github.com/grantjenks/python-sortedcontainers/issues/68
-    waiting_for_idle: Any = attrs.Factory(SortedDict)  # type: ignore[explicit-any]
-
-    @_public
-    async def wait_all_tasks_blocked(self, cushion: float = 0.0) -> None:
-        """Block until there are no runnable tasks.
-
-        This is useful in testing code when you want to give other tasks a
-        chance to "settle down". The calling task is blocked, and doesn't wake
-        up until all other tasks are also blocked for at least ``cushion``
-        seconds. (Setting a non-zero ``cushion`` is intended to handle cases
-        like two tasks talking to each other over a local socket, where we
-        want to ignore the potential brief moment between a send and receive
-        when all tasks are blocked.)
-
-        Note that ``cushion`` is measured in *real* time, not the Trio clock
-        time.
-
-        If there are multiple tasks blocked in :func:`wait_all_tasks_blocked`,
-        then the one with the shortest ``cushion`` is the one woken (and
-        this task becoming unblocked resets the timers for the remaining
-        tasks). If there are multiple tasks that have exactly the same
-        ``cushion``, then all are woken.
-
-        You should also consider :class:`trio.testing.Sequencer`, which
-        provides a more explicit way to control execution ordering within a
-        test, and will often produce more readable tests.
-
-        Example:
-          Here's an example of one way to test that Trio's locks are fair: we
-          take the lock in the parent, start a child, wait for the child to be
-          blocked waiting for the lock (!), and then check that we can't
-          release and immediately re-acquire the lock::
-
-             async def lock_taker(lock):
-                 await lock.acquire()
-                 lock.release()
-
-             async def test_lock_fairness():
-                 lock = trio.Lock()
-                 await lock.acquire()
-                 async with trio.open_nursery() as nursery:
-                     nursery.start_soon(lock_taker, lock)
-                     # child hasn't run yet, we have the lock
-                     assert lock.locked()
-                     assert lock._owner is trio.lowlevel.current_task()
-                     await trio.testing.wait_all_tasks_blocked()
-                     # now the child has run and is blocked on lock.acquire(), we
-                     # still have the lock
-                     assert lock.locked()
-                     assert lock._owner is trio.lowlevel.current_task()
-                     lock.release()
-                     try:
-                         # The child has a prior claim, so we can't have it
-                         lock.acquire_nowait()
-                     except trio.WouldBlock:
-                         assert lock._owner is not trio.lowlevel.current_task()
-                         print("PASS")
-                     else:
-                         print("FAIL")
-
-        """
-        task = current_task()
-        key = (cushion, id(task))
-        self.waiting_for_idle[key] = task
-
-        def abort(_: _core.RaiseCancelT) -> Abort:
-            del self.waiting_for_idle[key]
-            return Abort.SUCCEEDED
-
-        await wait_task_rescheduled(abort)
-
 
 ################################################################
 # run
@@ -2397,7 +2314,7 @@ def setup_runner(
         raise RuntimeError("Attempted to call run() from inside a run()")
 
     if clock is None:
-        clock = SystemClock()
+        clock = RealClock()
     instrument_group = Instruments(instruments)
     io_manager = TheIOManager()
     system_context = copy_context()
@@ -2453,7 +2370,7 @@ def run(
 
       clock: ``None`` to use the default system-specific monotonic clock;
           otherwise, an object implementing the :class:`trio.abc.Clock`
-          interface, like (for example) a :class:`trio.testing.MockClock`
+          interface, like (for example) a :class:`trio.testing.TestingClock`
           instance.
 
       instruments (list of :class:`trio.abc.Instrument` objects): Any
@@ -2736,25 +2653,17 @@ def unrolled_run(
         # You know how people talk about "event loops"? This 'while' loop right
         # here is our event loop:
         while runner.tasks:
-            if runner.runq:
-                timeout: float = 0
-            else:
-                deadline = runner.deadlines.next_deadline()
-                timeout = runner.clock.deadline_to_sleep_time(deadline)
+            # The clock decides how long the coming IO wait may last. A
+            # virtual clock may deliberately answer less than the true time
+            # to the next deadline, so that it hears about the run going
+            # idle through Clock.after_io_wait.
+            timeout = runner.clock.before_io_wait(
+                relative_deadline=(
+                    runner.deadlines.next_deadline() - runner.clock.current_time()
+                ),
+                anything_runnable=bool(runner.runq),
+            )
             timeout = min(max(0, timeout), _MAX_TIMEOUT)
-
-            idle_primed = None
-            if runner.waiting_for_idle:
-                cushion, _ = runner.waiting_for_idle.keys()[0]
-                if cushion < timeout:
-                    timeout = cushion
-                    idle_primed = IdlePrimedTypes.WAITING_FOR_IDLE
-            # We use 'elif' here because if there are tasks in
-            # wait_all_tasks_blocked, then those tasks will wake up without
-            # jumping the clock, so we don't need to autojump.
-            elif runner.clock_autojump_threshold < timeout:
-                timeout = runner.clock_autojump_threshold
-                idle_primed = IdlePrimedTypes.AUTOJUMP_CLOCK
 
             if "before_io_wait" in runner.instruments:
                 runner.instruments.call("before_io_wait", timeout)
@@ -2769,43 +2678,30 @@ def unrolled_run(
 
             # Process cancellations due to deadline expiry
             now = runner.clock.current_time()
-            if runner.deadlines.expire(now):
-                idle_primed = None
+            expired = runner.deadlines.expire(now)
 
-            # idle_primed != None means: if the IO wait hit the timeout, and
-            # still nothing is happening, then we should start waking up
-            # wait_all_tasks_blocked tasks or autojump the clock. But there
-            # are some subtleties in defining "nothing is happening".
-            #
-            # 'not runner.runq' means that no tasks are currently runnable.
-            # 'not events' means that the last IO wait call hit its full
-            # timeout. These are very similar, and if idle_primed != None and
-            # we're running in regular mode then they always go together. But,
-            # in *guest* mode, they can happen independently, even when
-            # idle_primed=True:
+            # Tell the clock what the wait produced. It decides for itself
+            # whether that amounts to the run going idle -- see
+            # Clock.after_io_wait. Note 'not runner.runq' and 'not events'
+            # are very similar, and in regular mode they always go together;
+            # but in *guest* mode they can happen independently:
             #
             # - runner.runq=empty and events=True: the host loop adjusted a
-            #   deadline and that forced an IO wakeup before the timeout expired,
-            #   even though no actual tasks were scheduled.
+            #   deadline and that forced an IO wakeup before the timeout
+            #   expired, even though no actual tasks were scheduled.
             #
             # - runner.runq=nonempty and events=False: the IO wait hit its
-            #   timeout, but then some code in the host thread rescheduled a task
-            #   before we got here.
+            #   timeout, but then some code in the host thread rescheduled a
+            #   task before we got here.
             #
-            # So we need to check both.
-            if idle_primed is not None and not runner.runq and not events:
-                if idle_primed is IdlePrimedTypes.WAITING_FOR_IDLE:
-                    while runner.waiting_for_idle:
-                        key, task = runner.waiting_for_idle.peekitem(0)
-                        if key[0] == cushion:
-                            del runner.waiting_for_idle[key]
-                            runner.reschedule(task)
-                        else:
-                            break
-                else:
-                    assert idle_primed is IdlePrimedTypes.AUTOJUMP_CLOCK
-                    assert isinstance(runner.clock, _core.MockClock)
-                    runner.clock._autojump()
+            # So the clock is told both.
+            runner.clock.after_io_wait(
+                saw_events=bool(events),
+                anything_runnable=bool(runner.runq),
+                deadline_expired=expired,
+                relative_deadline=runner.deadlines.next_deadline() - now,
+                reschedule=runner.reschedule,
+            )
 
             # Process all runnable tasks, but only the ones that are already
             # runnable now. Anything that becomes runnable during this cycle
@@ -2971,20 +2867,6 @@ class _TaskStatusIgnored(TaskStatus[object]):
 
 
 TASK_STATUS_IGNORED: Final[TaskStatus[object]] = _TaskStatusIgnored()
-
-
-def current_task() -> Task:
-    """Return the :class:`Task` object representing the current task.
-
-    Returns:
-      Task: the :class:`Task` that called :func:`current_task`.
-
-    """
-
-    try:
-        return GLOBAL_RUN_CONTEXT.task
-    except AttributeError:
-        raise RuntimeError("must be called from async context") from None
 
 
 def current_effective_deadline() -> float:

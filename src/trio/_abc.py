@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 import trio
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from types import TracebackType
 
     from typing_extensions import Self
@@ -21,11 +22,13 @@ class Clock(ABC):
 
     __slots__ = ()
 
-    @abstractmethod
-    def start_clock(self) -> None:
+    # The empty default is deliberate: most clocks have no setup to do.
+    def start_clock(self) -> None:  # noqa: B027
         """Do any setup this clock might need.
 
-        Called at the beginning of the run.
+        Called once at the beginning of the run, before any task starts. The
+        default does nothing, so a clock only needs to define this if it has
+        setup to do.
 
         """
 
@@ -41,27 +44,80 @@ class Clock(ABC):
 
         """
 
-    @abstractmethod
-    def deadline_to_sleep_time(self, deadline: float) -> float:
-        """Compute the real time until the given deadline.
+    def before_io_wait(
+        self,
+        *,
+        relative_deadline: float,
+        anything_runnable: bool,
+    ) -> float:
+        """Decide how many real seconds the run loop's next IO wait may last.
 
-        This is called before we enter a system-specific wait function like
-        :func:`select.select`, to get the timeout to pass.
+        Called unconditionally before every IO wait, just before the
+        :meth:`Instrument.before_io_wait` hooks observe the final timeout:
+        this method helps decide the timeout, instruments only watch it.
 
-        For a clock using wall-time, this should be something like::
+        ``relative_deadline`` is how far in the future the next deadline is,
+        in this clock's own time -- a span, never an absolute instant, so a
+        clock wrapping another clock has nothing to rebase. It may be
+        negative (the deadline has already passed) or :data:`math.inf`
+        (there is no deadline). ``anything_runnable`` means tasks are
+        already waiting to run, so the loop will only poll: return 0.
 
-           return deadline - self.current_time()
+        For a clock that runs at wall-clock rate the right answer is the
+        default::
 
-        but of course it may be different if you're implementing some kind of
-        virtual clock.
+           return 0 if anything_runnable else relative_deadline
 
-        Args:
-            deadline (float): The absolute time of the next deadline,
-                according to this clock.
+        A virtual clock converts the span into real seconds instead -- a
+        frozen clock can answer :data:`math.inf`, meaning no amount of real
+        waiting reaches the deadline. Answering *less* than the truth is
+        always safe: the run loop simply wakes early, reports what happened
+        through :meth:`after_io_wait`, and asks again -- which is exactly
+        how a virtual clock arranges to hear about the run going idle.
+        Never answer more.
 
         Returns:
-            float: The number of real seconds to sleep until the given
-            deadline. May be :data:`math.inf`.
+            float: The number of real seconds to sleep. May be
+            :data:`math.inf`; the run loop clamps from both sides.
+
+        """
+        if anything_runnable:
+            return 0
+        return relative_deadline
+
+    # The empty default is deliberate: a clock that measures real time has
+    # nothing to do here, and must not be forced to write a stub.
+    def after_io_wait(  # noqa: B027
+        self,
+        *,
+        saw_events: bool,
+        anything_runnable: bool,
+        deadline_expired: bool,
+        relative_deadline: float,
+        reschedule: Callable[[Task], None],
+    ) -> None:
+        """Called after every IO wait, with what it produced.
+
+        The run went *idle* exactly when none of ``saw_events``,
+        ``anything_runnable`` or ``deadline_expired`` is true: the wait ran
+        its full timeout and produced nothing, so nothing can make progress
+        until time passes.
+
+        ``relative_deadline`` is how far in the future the earliest
+        scheduled deadline now is, in this clock's own time (or
+        :data:`math.inf` if nothing is scheduled) -- like
+        :meth:`before_io_wait`, a span rather than an absolute time, so a
+        clock wrapping another clock has nothing to translate.
+        ``reschedule`` makes a task runnable again.
+
+        This runs after deadline expiry has been processed -- one step later
+        than the :meth:`Instrument.after_io_wait` hooks, which observe the
+        wait itself. The clock pair brackets outside the instrument pair:
+        the clock decides the wait's length and judges its outcome, while
+        instruments only watch.
+
+        The default does nothing, which is correct for a clock that measures
+        real time.
 
         """
 

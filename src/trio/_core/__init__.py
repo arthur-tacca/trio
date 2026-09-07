@@ -20,7 +20,6 @@ from ._exceptions import (
 )
 from ._ki import currently_ki_protected, disable_ki_protection, enable_ki_protection
 from ._local import RunVar, RunVarToken
-from ._mock_clock import MockClock
 from ._parking_lot import (
     ParkingLot,
     ParkingLotStatistics,
@@ -55,10 +54,10 @@ from ._run import (
     run,
     spawn_system_task,
     start_guest_run,
-    wait_all_tasks_blocked,
     wait_readable,
     wait_writable,
 )
+from ._testing_clock import TestingClock
 from ._thread_cache import start_thread_soon
 
 # Has to come after _run to resolve a circular import
@@ -72,6 +71,7 @@ from ._traps import (
     wait_task_rescheduled,
 )
 from ._unbounded_queue import UnboundedQueue, UnboundedQueueStatistics
+from ._wait_all_tasks_blocked import wait_all_tasks_blocked
 
 # Windows imports
 if sys.platform == "win32" or (

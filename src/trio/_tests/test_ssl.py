@@ -45,7 +45,7 @@ from ..testing import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
-    from trio._core import MockClock
+    from trio._core import TestingClock
     from trio._ssl import T_Stream
 
     from .._core._run import CancelScope
@@ -629,12 +629,12 @@ async def test_renegotiation_simple(client_ctx: SSLContext) -> None:
 
 @slow
 async def test_renegotiation_randomized(
-    mock_clock: MockClock,
+    testing_clock: TestingClock,
     client_ctx: SSLContext,
 ) -> None:
     # The only blocking things in this function are our random sleeps, so 0 is
     # a good threshold.
-    mock_clock.autojump_threshold = 0
+    testing_clock.autojump_threshold = 0
 
     import random
 

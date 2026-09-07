@@ -20,7 +20,7 @@ from trio.socket import AF_INET, AF_INET6, IPPROTO_TCP, SOCK_STREAM, SocketType
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from trio.testing import MockClock
+    from trio.testing import TestingClock
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup
@@ -281,7 +281,9 @@ class Scenario(trio.abc.SocketFactory, trio.abc.HostnameResolver):
         self.socket_count += 1
         return FakeSocket(self, family, type_, proto)
 
-    def _ip_to_gai_entry(self, ip: str) -> tuple[
+    def _ip_to_gai_entry(
+        self, ip: str
+    ) -> tuple[
         AddressFamily,
         SocketKind,
         int,
@@ -388,21 +390,21 @@ async def run_scenario(
         return (exc, scenario)
 
 
-async def test_one_host_quick_success(autojump_clock: MockClock) -> None:
+async def test_one_host_quick_success(autojump_clock: TestingClock) -> None:
     sock, _scenario = await run_scenario(80, [("1.2.3.4", 0.123, "success")])
     assert isinstance(sock, FakeSocket)
     assert sock.ip == "1.2.3.4"
     assert trio.current_time() == 0.123
 
 
-async def test_one_host_slow_success(autojump_clock: MockClock) -> None:
+async def test_one_host_slow_success(autojump_clock: TestingClock) -> None:
     sock, _scenario = await run_scenario(81, [("1.2.3.4", 100, "success")])
     assert isinstance(sock, FakeSocket)
     assert sock.ip == "1.2.3.4"
     assert trio.current_time() == 100
 
 
-async def test_one_host_quick_fail(autojump_clock: MockClock) -> None:
+async def test_one_host_quick_fail(autojump_clock: TestingClock) -> None:
     exc, _scenario = await run_scenario(
         82,
         [("1.2.3.4", 0.123, "error")],
@@ -412,7 +414,7 @@ async def test_one_host_quick_fail(autojump_clock: MockClock) -> None:
     assert trio.current_time() == 0.123
 
 
-async def test_one_host_slow_fail(autojump_clock: MockClock) -> None:
+async def test_one_host_slow_fail(autojump_clock: TestingClock) -> None:
     exc, _scenario = await run_scenario(
         83,
         [("1.2.3.4", 100, "error")],
@@ -422,7 +424,7 @@ async def test_one_host_slow_fail(autojump_clock: MockClock) -> None:
     assert trio.current_time() == 100
 
 
-async def test_one_host_failed_after_connect(autojump_clock: MockClock) -> None:
+async def test_one_host_failed_after_connect(autojump_clock: TestingClock) -> None:
     exc, _scenario = await run_scenario(
         83,
         [("1.2.3.4", 1, "postconnect_fail")],
@@ -432,7 +434,7 @@ async def test_one_host_failed_after_connect(autojump_clock: MockClock) -> None:
 
 
 # With the default 0.250 second delay, the third attempt will win
-async def test_basic_fallthrough(autojump_clock: MockClock) -> None:
+async def test_basic_fallthrough(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         [
@@ -452,7 +454,7 @@ async def test_basic_fallthrough(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_early_success(autojump_clock: MockClock) -> None:
+async def test_early_success(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         [
@@ -472,7 +474,7 @@ async def test_early_success(autojump_clock: MockClock) -> None:
 
 
 # With a 0.450 second delay, the first attempt will win
-async def test_custom_delay(autojump_clock: MockClock) -> None:
+async def test_custom_delay(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         [
@@ -492,7 +494,7 @@ async def test_custom_delay(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_none_default(autojump_clock: MockClock) -> None:
+async def test_none_default(autojump_clock: TestingClock) -> None:
     """Copy of test_basic_fallthrough, but specifying the delay =None"""
     sock, scenario = await run_scenario(
         80,
@@ -514,7 +516,7 @@ async def test_none_default(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_custom_errors_expedite(autojump_clock: MockClock) -> None:
+async def test_custom_errors_expedite(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         [
@@ -536,7 +538,7 @@ async def test_custom_errors_expedite(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_all_fail(autojump_clock: MockClock) -> None:
+async def test_all_fail(autojump_clock: TestingClock) -> None:
     exc, scenario = await run_scenario(
         80,
         [
@@ -564,7 +566,7 @@ async def test_all_fail(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_multi_success(autojump_clock: MockClock) -> None:
+async def test_multi_success(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         [
@@ -595,7 +597,7 @@ async def test_multi_success(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_does_reorder(autojump_clock: MockClock) -> None:
+async def test_does_reorder(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         [
@@ -616,7 +618,7 @@ async def test_does_reorder(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_handles_no_ipv4(autojump_clock: MockClock) -> None:
+async def test_handles_no_ipv4(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         # Here the ipv6 addresses fail at socket creation time, so the connect
@@ -639,7 +641,7 @@ async def test_handles_no_ipv4(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_handles_no_ipv6(autojump_clock: MockClock) -> None:
+async def test_handles_no_ipv6(autojump_clock: TestingClock) -> None:
     sock, scenario = await run_scenario(
         80,
         # Here the ipv6 addresses fail at socket creation time, so the connect
@@ -662,12 +664,12 @@ async def test_handles_no_ipv6(autojump_clock: MockClock) -> None:
     }
 
 
-async def test_no_hosts(autojump_clock: MockClock) -> None:
+async def test_no_hosts(autojump_clock: TestingClock) -> None:
     exc, _scenario = await run_scenario(80, [], expect_error=OSError)
     assert "no results found" in str(exc)
 
 
-async def test_cancel(autojump_clock: MockClock) -> None:
+async def test_cancel(autojump_clock: TestingClock) -> None:
     with trio.move_on_after(5) as cancel_scope:
         exc, scenario = await run_scenario(
             80,

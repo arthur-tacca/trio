@@ -441,7 +441,7 @@ def memory_stream_pair() -> tuple[
 
     Pro-tip: you can insert sleep calls (like in our example above) to
     manipulate the flow of data across tasks... and then use
-    :class:`MockClock` and its :attr:`~MockClock.autojump_threshold`
+    :class:`TestingClock` and its :attr:`~TestingClock.autojump_threshold`
     functionality to keep your test suite running quickly.
 
     If you want to stress test a protocol implementation, one nice trick is to

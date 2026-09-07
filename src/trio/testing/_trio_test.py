@@ -4,6 +4,7 @@ from functools import partial, wraps
 from typing import TYPE_CHECKING, TypeVar
 
 from .. import _core
+from .._core import TestingClock
 from ..abc import Clock, Instrument
 
 if TYPE_CHECKING:
@@ -35,7 +36,10 @@ def trio_test(fn: Callable[ArgsT, Awaitable[RetT]]) -> Callable[ArgsT, RetT]:
         __tracebackhide__ = True
         clocks = [c for c in kwargs.values() if isinstance(c, Clock)]
         if not clocks:
-            clock = None
+            # A TestingClock at rate 1.0 behaves exactly like real time, but
+            # also provides wait_all_tasks_blocked(), which tests reach for
+            # constantly. Tests that want virtual time pass their own clock.
+            clock: Clock | None = TestingClock(rate=1.0)
         elif len(clocks) == 1:
             clock = clocks[0]
         else:

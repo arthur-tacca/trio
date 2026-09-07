@@ -17,6 +17,8 @@ assert (
     sys.platform == "win32" or not TYPE_CHECKING
 )  # Skip type checking when not on Windows
 
+from trio._core import TestingClock
+
 from ... import _core, sleep
 from ...testing import wait_all_tasks_blocked
 from .tutil import gc_collect_harder, restore_unraisablehook, slow
@@ -208,7 +210,7 @@ def test_forgot_to_register_with_iocp() -> None:
                 assert left_run_yet
 
         with pytest.raises(_core.TrioInternalError) as exc_info:
-            _core.run(main)
+            _core.run(main, clock=TestingClock(rate=1.0))
         left_run_yet = True
         assert "Failed to cancel overlapped I/O in xyz " in str(exc_info.value)
         assert "forget to call register_with_iocp()?" in str(exc_info.value)

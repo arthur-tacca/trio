@@ -1,6 +1,7 @@
 import pytest
 
 from trio import run
+from trio._core import TestingClock
 from trio.lowlevel import RunVar, RunVarToken
 
 from ... import _core
@@ -97,7 +98,7 @@ def test_runvar_sync() -> None:
             await _core.wait_all_tasks_blocked()
             assert t1.get() == "haddock"
 
-    run(sync_check)
+    run(sync_check, clock=TestingClock(rate=1.0))
 
 
 def test_accessing_runvar_outside_run_call_fails() -> None:

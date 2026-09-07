@@ -485,7 +485,7 @@ async def test_as_safe_channel_no_race() -> None:
 
 
 async def test_as_safe_channel_buffer_size_too_small(
-    autojump_clock: trio.testing.MockClock,
+    autojump_clock: trio.testing.TestingClock,
 ) -> None:
     @as_safe_channel
     async def agen() -> AsyncGenerator[int]:
