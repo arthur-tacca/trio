@@ -569,7 +569,6 @@ def as_safe_channel(
                 await nursery.start(
                     _move_elems_to_channel, agen, send_chan, send_semaphore
                 )
-                # `async with recv_chan` could eat exceptions, so use sync cm
                 with RecvChanWrapper(recv_chan, send_semaphore) as wrapped_recv_chan:
                     yield wrapped_recv_chan
                 # User has exited context manager, cancel to immediately close the
@@ -597,8 +596,6 @@ def as_safe_channel(
         send_semaphore: trio.Semaphore,
         task_status: trio.TaskStatus,
     ) -> None:
-        # `async with send_chan` will eat exceptions,
-        # see https://github.com/python-trio/trio/issues/1559
         with send_chan:
             # replace try-finally with contextlib.aclosing once python39 is
             # dropped:
