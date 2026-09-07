@@ -6,9 +6,9 @@ import pytest
 from trio import sleep
 
 from ... import _core
+from ..._abc import Clock
 from .. import wait_all_tasks_blocked
 from .._mock_clock import MockClock
-from .._run import GLOBAL_RUN_CONTEXT
 from .tutil import slow
 
 
@@ -178,16 +178,96 @@ async def test_mock_clock_autojump_0_and_wait_all_tasks_blocked_nonzero(
     assert record == ["waiter done", "yawn"]
 
 
-async def test_initialization_doesnt_mutate_runner() -> None:
-    before = (
-        GLOBAL_RUN_CONTEXT.runner.clock,
-        GLOBAL_RUN_CONTEXT.runner.clock.autojump_threshold,
-    )
+def test_autojump_direct() -> None:
+    # The public hook the run loop drives autojump through: check its
+    # contract without a run.
+    c = MockClock(autojump_threshold=1.0)
+    c.autojump(10.0)  # jump exactly to the deadline
+    assert c.current_time() == 10.0
+    c.autojump(inf)  # nothing scheduled: nowhere to go
+    assert c.current_time() == 10.0
+    c.autojump(5.0)  # deadline in the past: time can't go backwards
+    assert c.current_time() == 10.0
 
-    MockClock(autojump_threshold=2, rate=3)
 
-    after = (
-        GLOBAL_RUN_CONTEXT.runner.clock,
-        GLOBAL_RUN_CONTEXT.runner.clock.autojump_threshold,
-    )
-    assert before == after
+def test_custom_clock_wrapping_mock_clock() -> None:
+    # https://github.com/python-trio/trio/issues/3369 -- delegating to a
+    # MockClock through nothing but the abc.Clock surface must behave
+    # identically to passing the MockClock itself.
+    class WrapperClock(Clock):
+        def __init__(self) -> None:
+            self._mock = MockClock(autojump_threshold=0)
+
+        def start_clock(self) -> None:
+            self._mock.start_clock()
+
+        def current_time(self) -> float:
+            return self._mock.current_time()
+
+        def deadline_to_sleep_time(self, deadline: float) -> float:
+            return self._mock.deadline_to_sleep_time(deadline)
+
+        def get_autojump_threshold(self) -> float:
+            return self._mock.get_autojump_threshold()
+
+        def autojump(self, next_deadline: float) -> None:
+            self._mock.autojump(next_deadline)
+
+    record: list[str] = []
+
+    async def sleeper() -> None:
+        await sleep(100)
+        record.append("yawn")
+
+    async def waiter() -> None:
+        await wait_all_tasks_blocked()
+        record.append("waiter woke")
+
+    async def main() -> None:
+        assert _core.current_time() == 0
+        await sleep(2)
+        assert _core.current_time() == 2
+        # wait_all_tasks_blocked still takes priority over the clock
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(sleeper)
+            nursery.start_soon(waiter)
+
+    _core.run(main, clock=WrapperClock())
+    assert record == ["waiter woke", "yawn"]
+
+
+def test_custom_clock_from_scratch() -> None:
+    # The idle machinery is reachable through the public Clock interface
+    # alone: a hand-rolled virtual clock sharing no code with MockClock.
+    class FrozenClock(Clock):
+        def __init__(self) -> None:
+            self._now = 0.0
+
+        def start_clock(self) -> None:
+            pass
+
+        def current_time(self) -> float:
+            return self._now
+
+        def deadline_to_sleep_time(self, deadline: float) -> float:
+            # frozen: no amount of real waiting reaches a future deadline
+            return 0 if deadline <= self._now else 999999999
+
+        def get_autojump_threshold(self) -> float:
+            return 0.0
+
+        def autojump(self, next_deadline: float) -> None:
+            if next_deadline < inf:
+                self._now = max(self._now, next_deadline)
+
+    clock = FrozenClock()
+
+    async def main() -> None:
+        await sleep(10)
+        await sleep(5)
+
+    start = time.perf_counter()
+    _core.run(main, clock=clock)
+    assert clock.current_time() == 15
+    # 15 virtual seconds in (much less than) 15 real ones
+    assert time.perf_counter() - start < 10

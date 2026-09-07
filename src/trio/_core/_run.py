@@ -2749,8 +2749,8 @@ def unrolled_run(
             # We use 'elif' here because if there are tasks in
             # wait_all_tasks_blocked, then those tasks will wake up without
             # jumping the clock, so we don't need to autojump.
-            elif runner.clock.autojump_threshold < timeout:
-                timeout = runner.clock.autojump_threshold
+            elif (threshold := runner.clock.get_autojump_threshold()) < timeout:
+                timeout = threshold
                 idle_primed = IdlePrimedTypes.AUTOJUMP_CLOCK
 
             if "before_io_wait" in runner.instruments:
@@ -2801,7 +2801,7 @@ def unrolled_run(
                             break
                 else:
                     assert idle_primed is IdlePrimedTypes.AUTOJUMP_CLOCK
-                    runner.clock.autojump()
+                    runner.clock.autojump(runner.deadlines.next_deadline())
 
             # Process all runnable tasks, but only the ones that are already
             # runnable now. Anything that becomes runnable during this cycle

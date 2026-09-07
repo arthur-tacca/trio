@@ -1,10 +1,8 @@
 import time
 from math import inf
 
-from .. import _core
 from .._abc import Clock
 from .._util import final
-from ._run import GLOBAL_RUN_CONTEXT
 
 ################################################################
 # The glorious MockClock
@@ -103,21 +101,19 @@ class MockClock(Clock):
     @autojump_threshold.setter
     def autojump_threshold(self, new_autojump_threshold: float) -> None:
         self._autojump_threshold = float(new_autojump_threshold)
-        self._try_resync_autojump_threshold()
 
-    def _try_resync_autojump_threshold(self) -> None:
-        try:
-            runner = GLOBAL_RUN_CONTEXT.runner
-            if runner.is_guest:
-                runner.force_guest_tick_asap()
-        except AttributeError:
-            pass
+    # The run loop pulls this every iteration, so an assignment to
+    # autojump_threshold takes effect on the loop's next pass; there is no
+    # state to publish anywhere.
+    def get_autojump_threshold(self) -> float:
+        return self._autojump_threshold
 
-    # Invoked by the run loop when runner.clock_autojump_threshold is
-    # exceeded.
-    def autojump(self) -> None:
-        statistics = _core.current_statistics()
-        jump = statistics.seconds_to_next_deadline
+    # Invoked by the run loop once it has proved the run idle for a full
+    # get_autojump_threshold(). Identical to the old private _autojump(),
+    # except that the next deadline is handed to us rather than fetched from
+    # the active run via _core.current_statistics().
+    def autojump(self, next_deadline: float) -> None:
+        jump = next_deadline - self.current_time()
         if 0 < jump < inf:
             self.jump(jump)
 
@@ -127,6 +123,8 @@ class MockClock(Clock):
         return self._virtual_base + virtual_offset
 
     def start_clock(self) -> None:
+        # Nothing to do: the run loop pulls get_autojump_threshold() every
+        # iteration, so there is no initial state to publish.
         pass
 
     def current_time(self) -> float:

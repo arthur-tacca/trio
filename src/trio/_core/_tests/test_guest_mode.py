@@ -187,13 +187,6 @@ def test_guest_is_initialized_when_start_returns() -> None:
         def deadline_to_sleep_time(self, deadline: float) -> float:
             raise NotImplementedError()
 
-        @property
-        def autojump_threshold(self) -> float:
-            raise NotImplementedError()
-
-        def autojump(self) -> None:
-            raise NotImplementedError()
-
     def after_start_never_runs() -> None:  # pragma: no cover
         pytest.fail("shouldn't get here")
 
@@ -663,23 +656,22 @@ def test_guest_mode_ki() -> None:
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
-def test_guest_mode_autojump_clock_threshold_changing() -> None:
-    # This is super obscure and probably no-one will ever notice, but
-    # technically mutating the MockClock.autojump_threshold from the host
-    # should wake up the guest, so let's test it.
-
-    clock = trio.testing.MockClock()
+def test_guest_mode_autojump_clock() -> None:
+    # Replaces test_guest_mode_autojump_clock_threshold_changing: the
+    # host-thread mid-run threshold change is gone, but autojumping under a
+    # guest run still needs coverage.
+    clock = trio.testing.MockClock(autojump_threshold=0)
 
     DURATION = 120
 
-    async def trio_main(in_host: InHost) -> None:
+    async def trio_main(in_host: InHost) -> str:
         assert trio.current_time() == 0
-        in_host(lambda: setattr(clock, "autojump_threshold", 0))
         await trio.sleep(DURATION)
         assert trio.current_time() == DURATION
+        return "ok"
 
     start = time.monotonic()
-    trivial_guest_run(trio_main, clock=clock)
+    assert trivial_guest_run(trio_main, clock=clock) == "ok"
     end = time.monotonic()
     # Should be basically instantaneous, but we'll leave a generous buffer to
     # account for any CI weirdness

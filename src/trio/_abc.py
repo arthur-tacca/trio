@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from math import inf
 import socket
 from abc import ABC, abstractmethod
+from math import inf
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 import trio
@@ -66,13 +66,41 @@ class Clock(ABC):
 
         """
 
-    @property
-    def autojump_threshold(self) -> float:
+    def get_autojump_threshold(self) -> float:
+        """How long the run loop may sit *provably idle*, in real seconds,
+        before it jumps this clock forward by calling :meth:`autojump`.
+
+        The run loop calls this every iteration and uses the result to bound
+        its IO wait, so a change takes effect on the next pass. The default
+        is :data:`math.inf` -- never autojump -- which is correct for any
+        clock that measures real time.
+
+        See :attr:`trio.testing.MockClock.autojump_threshold` for the
+        user-facing knob this exposes.
+
+        .. note:: Tasks blocked in `trio.testing.wait_all_tasks_blocked`
+           count as activity: while any exist they take priority over the
+           clock, and neither this nor :meth:`autojump` is called.
+
+        """
         return inf
 
-    def autojump(self) -> None:
-        # If `autojump_threshold()` has the default implementation (returning `inf`),
-        # this will never be called.
+    def autojump(self, next_deadline: float) -> None:
+        """Jump this clock forward, because the run loop has proved the run
+        idle for a full :meth:`get_autojump_threshold`.
+
+        "Idle" means the last IO wait ran its full timeout and produced
+        nothing: no events arrived, no deadline expired, and no task is
+        runnable. Nothing in the run can make progress until time passes.
+
+        ``next_deadline`` is the earliest scheduled deadline, or
+        :data:`math.inf` if there is none.
+
+        If :meth:`get_autojump_threshold` has the default implementation
+        (returning :data:`math.inf`), this is never called, so a clock that
+        measures real time need not implement it.
+
+        """
         raise NotImplementedError
 
 
