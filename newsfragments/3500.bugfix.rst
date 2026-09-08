@@ -1,0 +1,8 @@
+Fix a crash on macOS and the BSDs when running Trio in guest mode: if host-loop
+code cancelled a task blocked in `trio.lowlevel.wait_readable`,
+`trio.lowlevel.wait_writable` or `trio.Process.wait` (for example, from a GUI
+"cancel" button) in the brief window after Trio had fetched a batch of I/O
+events but before it had processed them, the stale event caused a ``KeyError``
+inside the kqueue backend, reported as a `trio.TrioInternalError`. Calling
+`trio.lowlevel.notify_closing` from the host loop in the same window raised a
+spurious ``OSError``. Such stale events are now ignored.

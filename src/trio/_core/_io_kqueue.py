@@ -90,7 +90,14 @@ class KqueueIOManager:
             if event.ident == self._force_wakeup_fd:
                 self._force_wakeup.drain()
                 continue
-            receiver = self._registered[key]
+            receiver = self._registered.get(key)
+            if receiver is None:
+                # In guest mode, host-loop code runs in between get_events()
+                # fetching this batch and us processing it. If that code
+                # cancelled the waiting task (or called notify_closing), the
+                # registration was removed while this event was already
+                # fetched. Nothing is waiting for it any more, so drop it.
+                continue
             if event.flags & select.KQ_EV_ONESHOT:  # TODO: test this branch
                 del self._registered[key]
             if isinstance(receiver, _core.Task):
@@ -103,11 +110,13 @@ class KqueueIOManager:
     # automatically register filters for child processes. So our lowlevel
     # API is *very* low-level: we expose the kqueue itself for adding
     # events or sticking into AIO submission structs, and split waiting
-    # off into separate methods. It's your responsibility to make sure
-    # that handle_io never receives an event without a corresponding
-    # registration! This may be challenging if you want to be careful
-    # about e.g. KeyboardInterrupt. Possibly this API could be improved to
-    # be more ergonomic...
+    # off into separate methods. Events that arrive without a corresponding
+    # registration are silently dropped by process_events (this can happen
+    # legitimately in guest mode, see the comment there), so it's your
+    # responsibility to deregister anything you're no longer waiting on.
+    # This may be challenging if you want to be careful about e.g.
+    # KeyboardInterrupt. Possibly this API could be improved to be more
+    # ergonomic...
 
     @_public
     def current_kqueue(self) -> select.kqueue:
@@ -280,7 +289,19 @@ class KqueueIOManager:
 
             if type(receiver) is _core.Task:
                 event = select.kevent(fd, filter_, select.KQ_EV_DELETE)
-                self._kqueue.control([event], 0)
+                try:
+                    self._kqueue.control([event], 0)
+                except OSError as error:
+                    # There may be nothing left to delete: the fd could have
+                    # been closed behind our back (EBADF on FreeBSD, ENOENT on
+                    # macOS), or in guest mode the one-shot event may have
+                    # fired and been fetched but not yet processed (ENOENT).
+                    # Either way process_events will drop the stale event,
+                    # and the task still gets ClosedResourceError below.
+                    if error.errno in (errno.EBADF, errno.ENOENT):  # pragma: no branch
+                        pass
+                    else:  # pragma: no cover
+                        raise
                 exc = _core.ClosedResourceError("another task closed this fd")
                 _core.reschedule(receiver, outcome.Error(exc))
                 del self._registered[key]

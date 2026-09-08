@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import select
 import sys
 from typing import TYPE_CHECKING
@@ -42,7 +43,17 @@ async def wait_child_exiting(process: _subprocess.Process) -> None:
         return
 
     def abort(_: _core.RaiseCancelT) -> _core.Abort:
-        kqueue.control([make_event(select.KQ_EV_DELETE)], 0)
+        try:
+            kqueue.control([make_event(select.KQ_EV_DELETE)], 0)
+        except OSError as error:
+            # In guest mode, the one-shot exit event may already have been
+            # fetched by get_events() but not yet processed, in which case
+            # the registration is gone (ENOENT) and process_events will
+            # drop the stale event.
+            if error.errno == errno.ENOENT:  # pragma: no branch
+                pass
+            else:  # pragma: no cover
+                raise
         return _core.Abort.SUCCEEDED
 
     await _core.wait_kevent(process.pid, select.KQ_FILTER_PROC, abort)
