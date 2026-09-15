@@ -44,6 +44,35 @@ async def test_Event() -> None:
         assert record == ["sleeping", "sleeping", "woken", "woken"]
 
 
+async def test_Event_set_then_cancel() -> None:
+    # Test the strengthened cancellation guarantee in Event.wait(): it
+    # recognises an enclosing cancellation even if it happens in the small
+    # window between the event being set and the waiter task resuming.
+    e = Event()
+    record: list[str] = []
+    scope = _core.CancelScope()
+
+    async def child() -> None:
+        with scope:
+            await e.wait()
+            record.append("woken")  # e.wait() did not notice the cancellation
+        record.append("exited")
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(child)
+        await wait_all_tasks_blocked()
+        e.set()
+        scope.cancel()  # cancellation after Event is set
+
+    assert record == ["exited"]
+    assert scope.cancelled_caught
+
+    # Check the Event is still usable as normal
+    assert e.is_set()
+    with assert_checkpoints():
+        await e.wait()
+
+
 async def test_CapacityLimiter() -> None:
     with pytest.raises(TypeError):
         CapacityLimiter(1.0)
