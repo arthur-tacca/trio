@@ -1058,10 +1058,12 @@ for running there, with some big restrictions:
   anything that needs threads (`trio.to_thread`, `trio.Path`,
   `trio.open_file`, ...), subprocesses, or signals. What does work is
   the core: tasks, nurseries, timeouts and cancellation, and Trio's
-  synchronization primitives. Trio doesn't yet provide any way to await
-  JavaScript promises from Trio code, or vice versa; but JavaScript
-  callbacks can wake up Trio tasks with `TrioToken.run_sync_soon`, or
-  by directly calling synchronous Trio functions like `trio.Event.set`.
+  synchronization primitives. JavaScript callbacks can wake up Trio
+  tasks with `TrioToken.run_sync_soon`, or by directly calling
+  synchronous Trio functions like `trio.Event.set`. And the
+  ``trio.pyodide`` module, described below, lets Trio tasks wait for
+  JavaScript promises, and make HTTP requests with the browser's
+  ``fetch``.
 
 Here's what the host loop glue looks like::
 
@@ -1104,6 +1106,57 @@ Here's what the host loop glue looks like::
 milliseconds, which limits how fast Trio can switch between tasks. If
 that matters to you, use something like a ``MessageChannel`` to
 implement ``run_sync_soon`` instead.)
+
+**JavaScript promises and fetch:** ``import trio.pyodide`` gives you
+two things. (It's not documented with autodoc, because it can only be
+imported under Pyodide.)
+
+``await trio.pyodide.wait_promise(promise, *, abort_controller=None)``
+waits for a JavaScript promise and returns the value it was fulfilled
+with. If it's rejected with a JavaScript ``Error``, that's raised, as a
+`pyodide.ffi.JsException`; anything else it's rejected with is wrapped
+in ``trio.pyodide.JsPromiseRejected``. (Though as of Pyodide 0.28,
+a promise rejected with something that isn't an ``Error`` fails inside
+Pyodide before Trio gets to see it.) Don't ``await`` a promise directly
+from a Trio task: Pyodide's support for that is built on asyncio, and
+it won't work.
+
+JavaScript promises can't be cancelled, so cancelling a task that's
+waiting on one doesn't interrupt it: the task keeps waiting until the
+promise settles. But if you pass an ``AbortController`` whose signal
+the operation respects, then the cancellation aborts it, with a
+JavaScript ``Error`` whose ``name`` is ``"TrioCancelled"`` (also
+available as ``trio.pyodide.CANCELLED_ERROR_NAME``). When the promise
+is then rejected because of that abort, the task's `~trio.Cancelled`
+is raised. If the promise is fulfilled anyway, the value is returned,
+and the cancellation is delivered at the task's next checkpoint. The
+same thing happens if you abort the controller yourself while the task
+is cancelled; if you abort it while the task *isn't* cancelled, the
+``AbortError`` is raised like any other rejection.
+
+``await trio.pyodide.fetch(url, *, method="GET", headers=None,
+body=None, **options)`` makes an HTTP request with the browser's
+``fetch``, and returns a ``trio.pyodide.Response`` once the status
+line and headers have arrived. Each request gets its own
+``AbortController``, so cancelling the task aborts the request, both
+while waiting for the response and while reading its body::
+
+   async with await trio.pyodide.fetch(
+       "https://example.com/api", method="POST", body=b"...",
+       headers={"content-type": "application/octet-stream"},
+   ) as response:
+       print(response.status, response.headers)
+       with trio.fail_after(10):
+           data = await response.json()   # or .text(), .bytes()
+       # or stream it: response.body is a trio.abc.ReceiveStream
+       async for chunk in response.body:
+           ...
+
+``body`` can be bytes-like or a string; other keyword arguments are
+passed through to ``fetch`` as request options, such as
+``credentials="include"``. Network failures are raised as
+`pyodide.ffi.JsException`. Once a request has been aborted, reading
+anything more from it raises `~trio.BrokenResourceError`.
 
 
 Limitations

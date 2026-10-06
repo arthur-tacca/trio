@@ -1,6 +1,6 @@
 """Smoke test for Trio's guest mode on Emscripten.
 
-This runs *inside* Pyodide, driven by run_smoke_test.mjs. It checks that
+This runs *inside* Pyodide, driven by run_tests.mjs. It checks that
 sleeping, nurseries and cancellation work on top of the JavaScript event loop,
 and that the things that can't work on Emscripten fail in the expected way.
 """
