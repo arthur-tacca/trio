@@ -1,4 +1,5 @@
-"""Test for trio.pyodide (fetch, and waiting for JavaScript promises).
+"""Test for trio.pyodide: calling JavaScript from Trio and Trio from
+JavaScript, and fetch.
 
 This runs *inside* Pyodide, driven by run_tests.mjs, which also provides the
 HTTP server at js.TEST_BASE_URL.
@@ -62,6 +63,14 @@ async def expect_closed(response: trio.pyodide.Response) -> None:
     raise AssertionError("body should be closed")
 
 
+async def expect_broken(fn: Callable[[], Awaitable[object]]) -> str:
+    try:
+        await fn()
+    except trio.BrokenResourceError as exc:
+        return str(exc)
+    raise AssertionError("expected BrokenResourceError")
+
+
 async def trio_main() -> dict[str, object]:
     base = js.TEST_BASE_URL
     results: dict[str, object] = {}
@@ -70,18 +79,101 @@ async def trio_main() -> dict[str, object]:
         # Printed as we go, so a hang shows where it happened
         print(" ...", label)
 
-    # --- wait_promise on its own ---------------------------------------------
-    progress("wait_promise on its own")
-    assert await trio.pyodide.wait_promise(js.Promise.resolve("resolved")) == "resolved"
-    rejected_in_js = run_js("Promise.reject(new RangeError('nope'))")
+    # --- call and call_method ------------------------------------------------
+    progress("call and call_method")
+    assert await trio.pyodide.call(run_js("(a, b) => a + b"), 1, 2) == 3
+    obj = await trio.pyodide.call(run_js("async (x) => ({ x })"), 5)
+    assert obj.x == 5
+    results["call: sync and async functions"] = True
     message = await expect_js_error(
         "RangeError",
-        lambda: trio.pyodide.wait_promise(rejected_in_js),
+        lambda: trio.pyodide.call(
+            run_js("async () => { throw new RangeError('nope'); }")
+        ),
     )
-    results["rejected promise"] = f"RangeError: {message}"
-    # (A promise rejected with something that isn't an Error can't be tested
-    # here: Pyodide attaches its own handlers to every promise that reaches
-    # Python, and they fail on non-Error rejections, before Trio sees them.)
+    results["call: rejected with an Error"] = f"RangeError: {message}"
+    message = await expect_js_error(
+        "TypeError",
+        lambda: trio.pyodide.call(run_js("() => { throw new TypeError('sync'); }")),
+    )
+    results["call: synchronous throw"] = f"TypeError: {message}"
+    rejected: trio.pyodide.JsPromiseRejected | None = None
+    try:
+        await trio.pyodide.call(run_js("async () => { throw 'a string'; }"))
+    except trio.pyodide.JsPromiseRejected as exc:
+        rejected = exc
+    assert rejected is not None
+    assert rejected.reason == "a string"
+    results["call: rejected with a non-Error"] = repr(rejected.reason)
+    headers = run_js("new Headers({ a: '1' })")
+    assert await trio.pyodide.call_method(headers, "get", "a") == "1"
+    results["call_method"] = True
+    message = await expect_js_error(
+        "TypeError",
+        lambda: trio.pyodide.call_method(headers, "nonsense"),
+    )
+    results["call_method: not a method"] = f"TypeError: {message}"
+
+    progress("wait_promise")
+    assert await trio.pyodide.wait_promise(js.Promise.resolve("resolved")) == "resolved"
+    message = await expect_js_error(
+        "RangeError",
+        lambda: trio.pyodide.wait_promise(
+            run_js("Promise.reject(new RangeError('nope'))")
+        ),
+    )
+    results["wait_promise: rejected with an Error"] = f"RangeError: {message}"
+
+    # --- callable_from_js ----------------------------------------------------
+    progress("callable_from_js")
+
+    async def double(x: int) -> int:
+        await trio.sleep(0.01)
+        return x * 2
+
+    async def boom() -> None:
+        await trio.sleep(0.01)
+        raise ValueError("boom")
+
+    # The JS helpers below receive the Python function as a borrowed proxy and
+    # call it synchronously; the promises they return come back to Python as
+    # converted promises, which is what wait_promise is for.
+    async with trio.open_nursery() as nursery:
+        start_double = trio.pyodide.callable_from_js(nursery, double)
+        promise = run_js("(start) => Promise.all([start(21), start(4)])")(start_double)
+        values = await trio.pyodide.wait_promise(promise)
+        assert values.to_py() == [42, 8], values
+        results["callable_from_js: results"] = values.to_py()
+
+        promise = run_js(
+            "(start) => start().catch((e) => e.name + ': ' + e.message + ' | ' + e.stack.split('\\n')[0])",
+        )(trio.pyodide.callable_from_js(nursery, boom))
+        description = await trio.pyodide.wait_promise(promise)
+        assert (
+            description == "ValueError: boom | Traceback (most recent call last):"
+        ), description
+        results["callable_from_js: exception"] = description
+
+        start_forever = trio.pyodide.callable_from_js(nursery, trio.sleep_forever)
+        promise = run_js(
+            """(start) => {
+                const controller = new AbortController();
+                const promise = start.callKwargs({ signal: controller.signal });
+                setTimeout(() => controller.abort(), 20);
+                return promise.catch((e) => e.name);
+            }""",
+        )(start_forever)
+        assert await trio.pyodide.wait_promise(promise) == "AbortError"
+        results["callable_from_js: aborted from JS"] = True
+
+        promise = run_js("(start) => start().catch((e) => e.name)")(start_forever)
+        await trio.sleep(0.01)
+        nursery.cancel_scope.cancel()
+    assert await trio.pyodide.wait_promise(promise) == trio.pyodide.CANCELLED_ERROR_NAME
+    results["callable_from_js: cancelled by Trio"] = True
+    promise = run_js("(start) => start(1).catch((e) => e.name)")(start_double)
+    assert await trio.pyodide.wait_promise(promise) == "RuntimeError"
+    results["callable_from_js: after the nursery closed"] = True
 
     # --- basic requests ------------------------------------------------------
     progress("basic requests")
@@ -144,19 +236,8 @@ async def trio_main() -> dict[str, object]:
     assert received.startswith(b"chunk0\n"), received
     results["cancelled while streaming"] = received
     # The request was aborted, so there's nothing more to read
-    broken: trio.BrokenResourceError | None = None
-    try:
-        await response.body.receive_some()
-    except trio.BrokenResourceError as exc:
-        broken = exc
-    assert broken is not None
-    results["read after cancel"] = f"BrokenResourceError: {broken}"
-    broken = None
-    try:
-        await response.text()
-    except trio.BrokenResourceError as exc:
-        broken = exc
-    assert broken is not None
+    results["read after cancel"] = await expect_broken(response.body.receive_some)
+    await expect_broken(response.text)
 
     # --- partial reads, closing ----------------------------------------------
     progress("partial reads, closing")
@@ -215,7 +296,7 @@ def done_callback(outcome: Outcome[dict[str, object]]) -> None:
     print("guest run finished after", round(time.perf_counter() - started, 3), "s")
     for key, value in results.items():
         print(f"  {key}: {value}")
-    print("FETCH TEST PASSED")
+    print("PYODIDE TEST PASSED")
 
 
 assert sys.platform == "emscripten"

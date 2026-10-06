@@ -1107,19 +1107,27 @@ milliseconds, which limits how fast Trio can switch between tasks. If
 that matters to you, use something like a ``MessageChannel`` to
 implement ``run_sync_soon`` instead.)
 
-**JavaScript promises and fetch:** ``import trio.pyodide`` gives you
-two things. (It's not documented with autodoc, because it can only be
-imported under Pyodide.)
+**Calling JavaScript from Trio, and Trio from JavaScript:** ``import
+trio.pyodide`` gives you these. (The module isn't documented with
+autodoc, because it can only be imported under Pyodide.)
 
-``await trio.pyodide.wait_promise(promise, *, abort_controller=None)``
-waits for a JavaScript promise and returns the value it was fulfilled
-with. If it's rejected with a JavaScript ``Error``, that's raised, as a
-`pyodide.ffi.JsException`; anything else it's rejected with is wrapped
-in ``trio.pyodide.JsPromiseRejected``. (Though as of Pyodide 0.28,
-a promise rejected with something that isn't an ``Error`` fails inside
-Pyodide before Trio gets to see it.) Don't ``await`` a promise directly
-from a Trio task: Pyodide's support for that is built on asyncio, and
-it won't work.
+``await trio.pyodide.call(function, *args, abort_controller=None)``
+calls a JavaScript function, waits for the promise it returns if it
+returns one, and gives you the result. ``await
+trio.pyodide.call_method(obj, name, *args, abort_controller=None)``
+does the same for a method, with ``obj`` as ``this``. If the function
+throws, or its promise is rejected, with a JavaScript ``Error``, that's
+raised, as a `pyodide.ffi.JsException`; anything else it's rejected
+with is wrapped in ``trio.pyodide.JsPromiseRejected``.
+
+These call the function from JavaScript, so that its promise never
+reaches Python. That matters: Pyodide turns every promise that reaches
+Python into an `asyncio.Future`. Awaiting one of those from a Trio task
+doesn't work, and handing it back to JavaScript gives you a different,
+derived promise. If you already have such a converted promise, ``await
+trio.pyodide.wait_promise(promise, abort_controller=None)`` waits for
+it, through the future's ``then`` method, with the same results and
+cancellation behaviour as `call`.
 
 JavaScript promises can't be cancelled, so cancelling a task that's
 waiting on one doesn't interrupt it: the task keeps waiting until the
@@ -1133,6 +1141,33 @@ and the cancellation is delivered at the task's next checkpoint. The
 same thing happens if you abort the controller yourself while the task
 is cancelled; if you abort it while the task *isn't* cancelled, the
 ``AbortError`` is raised like any other rejection.
+
+In the other direction, ``trio.pyodide.callable_from_js(nursery,
+async_fn)`` returns a function that JavaScript can call. Each call
+starts ``async_fn(*args)`` as a task in the nursery, and immediately
+returns a JavaScript ``Promise`` for its result::
+
+   async def main():
+       async with trio.open_nursery() as nursery:
+           js.myApp.fetchUser = trio.pyodide.callable_from_js(nursery, fetch_user)
+           await trio.sleep_forever()
+
+   // and then, in JavaScript:
+   const user = await myApp.fetchUser(42);
+   const controller = new AbortController();
+   await myApp.fetchUser.callKwargs(42, { signal: controller.signal });
+
+The return value is converted with `pyodide.ffi.to_js`. If the task
+raises, the promise is rejected with an ``Error`` whose ``name`` is the
+exception type's name and whose ``stack`` is the Python traceback; the
+exception goes to the JavaScript caller only, and doesn't crash the
+nursery. JavaScript can pass an ``AbortSignal`` as the ``signal``
+keyword argument; aborting it cancels the task, and the promise is
+rejected with the signal's reason. A task cancelled by Trio instead,
+say because the nursery was cancelled, rejects its promise with an
+``Error`` named ``"TrioCancelled"``. (Pyodide's own way of awaiting a
+Python coroutine from JavaScript runs it on asyncio, so it can't be
+used with Trio.)
 
 ``await trio.pyodide.fetch(url, *, method="GET", headers=None,
 body=None, **options)`` makes an HTTP request with the browser's
