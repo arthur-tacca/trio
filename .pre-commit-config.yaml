@@ -53,7 +53,7 @@ repos:
         entry: python src/trio/_tools/gen_exports.py
         pass_filenames: false
         additional_dependencies: ["astor", "attrs", "black", "ruff>=0.15.22"]
-        files: ^src\/trio\/_core\/(_run|(_i(o_(common|epoll|kqueue|windows)|nstrumentation)))\.py$
+        files: ^src\/trio\/_core\/(_run|(_i(o_(common|emscripten|epoll|kqueue|windows)|nstrumentation)))\.py$
       - id: regenerate-windows-cffi
         name: regenerate windows CFFI
         language: python

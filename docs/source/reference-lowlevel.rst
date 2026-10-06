@@ -1032,6 +1032,80 @@ a cleanly-integrated hybrid event loop. Go make some cool
 GUIs/games/whatever!
 
 
+.. _guest-run-emscripten:
+
+Running Trio in the browser with Pyodide
+----------------------------------------
+
+`Pyodide <https://pyodide.org/>`__ runs CPython in a web browser,
+compiled to WebAssembly with Emscripten. Trio has experimental support
+for running there, with some big restrictions:
+
+- `trio.run` doesn't work, because it would block the browser's only
+  thread. Instead, you use guest mode, with the browser's event loop
+  as the host.
+
+- There are no threads on Emscripten, so Trio can't use its usual
+  trick of waiting for timeouts in a worker thread. Instead, you have
+  to pass an extra ``run_sync_later=`` argument to `start_guest_run`,
+  which Trio uses to ask the host loop to call it back after a delay.
+
+- Browsers don't offer sockets or file descriptors, so Trio doesn't do
+  any I/O on Emscripten: `trio.lowlevel.wait_readable` and
+  `trio.lowlevel.wait_writable` raise `NotImplementedError`, and so
+  everything built on them (`trio.socket`, `trio.open_tcp_stream`,
+  `trio.lowlevel.FdStream`, ...) doesn't work either. Neither does
+  anything that needs threads (`trio.to_thread`, `trio.Path`,
+  `trio.open_file`, ...), subprocesses, or signals. What does work is
+  the core: tasks, nurseries, timeouts and cancellation, and Trio's
+  synchronization primitives. Trio doesn't yet provide any way to await
+  JavaScript promises from Trio code, or vice versa; but JavaScript
+  callbacks can wake up Trio tasks with `TrioToken.run_sync_soon`, or
+  by directly calling synchronous Trio functions like `trio.Event.set`.
+
+Here's what the host loop glue looks like::
+
+   import js
+   from pyodide.ffi import create_once_callable, create_proxy
+   import trio
+
+   def run_sync_soon(fn):
+       js.setTimeout(create_once_callable(fn), 0)
+
+   def run_sync_later(fn, delay):
+       # Keep the Python function alive until it's either called or
+       # cancelled, then let it go again
+       def fire():
+           try:
+               fn()
+           finally:
+               proxy.destroy()
+
+       proxy = create_proxy(fire)
+       handle = js.setTimeout(proxy, delay * 1000)
+
+       def cancel():
+           js.clearTimeout(handle)
+           proxy.destroy()
+
+       return cancel
+
+   def done_callback(trio_main_outcome):
+       print(f"Trio program ended with: {trio_main_outcome}")
+
+   trio.lowlevel.start_guest_run(
+       trio_main,
+       run_sync_soon_threadsafe=run_sync_soon,
+       run_sync_later=run_sync_later,
+       done_callback=done_callback,
+   )
+
+(Browsers clamp nested ``setTimeout(..., 0)`` calls to a few
+milliseconds, which limits how fast Trio can switch between tasks. If
+that matters to you, use something like a ``MessageChannel`` to
+implement ``run_sync_soon`` instead.)
+
+
 Limitations
 -----------
 

@@ -78,3 +78,9 @@ doc/_build/
 
 # PyCharm
 .idea/
+
+# Pyodide smoke test (see tests/pyodide/README.rst)
+node_modules/
+package.json
+package-lock.json
+pyodide-deps/

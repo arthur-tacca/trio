@@ -84,7 +84,9 @@ if sys.platform != "win32" or (
 
     # Kqueue-specific symbols
     if (
-        sys.platform != "linux" and (_t.TYPE_CHECKING or not hasattr(_select, "epoll"))
+        sys.platform != "linux"
+        and sys.platform != "emscripten"
+        and (_t.TYPE_CHECKING or not hasattr(_select, "epoll"))
     ) or (not _t.TYPE_CHECKING and "sphinx.ext.autodoc" in sys.modules):
         from ._core import (
             current_kqueue as current_kqueue,

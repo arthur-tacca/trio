@@ -1739,6 +1739,13 @@ class GuestState:  # type: ignore[explicit-any]
     done_callback: Callable[[Outcome[Any]], object]  # type: ignore[explicit-any]
     unrolled_run_gen: Generator[float, EventResult, None]
     unrolled_run_next_send: Outcome[Any] = attrs.Factory(lambda: Value(None))  # type: ignore[explicit-any]
+    # Emscripten only: asks the host loop to call a function after a delay,
+    # and returns a function that cancels that. See start_guest_run.
+    run_sync_later: (
+        Callable[[Callable[[], object], float], Callable[[], object]] | None
+    ) = None
+    host_timer_cancel: Callable[[], object] | None = None
+    host_timer_token: object | None = None
 
     def guest_tick(self) -> None:
         prev_library, sniffio_library.name = sniffio_library.name, "trio"
@@ -1764,6 +1771,33 @@ class GuestState:  # type: ignore[explicit-any]
             self.unrolled_run_next_send = events_outcome
             self.runner.guest_tick_scheduled = True
             self.run_sync_soon_not_threadsafe(self.guest_tick)
+        elif self.run_sync_later is not None:
+            # Emscripten: there are no worker threads, but there's also
+            # nothing to wait for except the timeout, so we ask the host loop
+            # to call us back when it expires. If the host does something
+            # that needs Trio's attention before then (rescheduling a task,
+            # changing a deadline, calling run_sync_soon), that goes through
+            # Runner.force_guest_tick_asap -> EmscriptenIOManager.force_wakeup
+            # -> self.wake_up_from_host, which cancels the timer and schedules
+            # a tick right away instead.
+            self.runner.guest_tick_scheduled = False
+            token = object()
+
+            def host_timer_expired() -> None:
+                if self.host_timer_token is not token:  # pragma: no cover
+                    # This timer was cancelled. A well-behaved host shouldn't
+                    # call us, but it doesn't hurt to be defensive.
+                    return
+                self.host_timer_token = self.host_timer_cancel = None
+                self.unrolled_run_next_send = capture(
+                    self.runner.io_manager.get_events,
+                    0,
+                )
+                self.runner.guest_tick_scheduled = True
+                self.guest_tick()
+
+            self.host_timer_token = token
+            self.host_timer_cancel = self.run_sync_later(host_timer_expired, timeout)
         else:
             # Need to go into the thread and call get_events() there
             self.runner.guest_tick_scheduled = False
@@ -1780,6 +1814,17 @@ class GuestState:  # type: ignore[explicit-any]
                 self.run_sync_soon_threadsafe(in_main_thread)
 
             start_thread_soon(get_events, deliver)
+
+    def wake_up_from_host(self) -> None:
+        # Emscripten only. Called (via EmscriptenIOManager.force_wakeup) from
+        # Runner.force_guest_tick_asap, when host code did something that
+        # needs a guest tick while we were waiting on a host timer.
+        self.host_timer_token = None
+        cancel, self.host_timer_cancel = self.host_timer_cancel, None
+        if cancel is not None:
+            cancel()
+        self.unrolled_run_next_send = capture(self.runner.io_manager.get_events, 0)
+        self.run_sync_soon_not_threadsafe(self.guest_tick)
 
 
 @attrs.define(eq=False)
@@ -2501,6 +2546,13 @@ def run(
           propagates it.
 
     """
+    if sys.platform == "emscripten":
+        raise NotImplementedError(
+            "trio.run() isn't supported on Emscripten, because it would have "
+            "to block the browser's main thread; use "
+            "trio.lowlevel.start_guest_run() instead",
+        )
+
     if strict_exception_groups is not None and not strict_exception_groups:
         warn_deprecated(
             "trio.run(..., strict_exception_groups=False)",
@@ -2554,6 +2606,9 @@ def start_guest_run(  # type: ignore[explicit-any]
         Callable[[Callable[[], object]], object] | None
     ) = None,
     host_uses_signal_set_wakeup_fd: bool = False,
+    run_sync_later: (
+        Callable[[Callable[[], object], float], Callable[[], object]] | None
+    ) = None,
     clock: Clock | None = None,
     instruments: Sequence[Instrument] = (),
     restrict_keyboard_interrupt_to_checkpoints: bool = False,
@@ -2615,6 +2670,21 @@ def start_guest_run(  # type: ignore[explicit-any]
          uses `signal.set_wakeup_fd`, and `False` otherwise. For more details,
          see :ref:`guest-run-implementation`.
 
+      run_sync_later: Only used on Emscripten (e.g. Pyodide), where it's
+         required; on other platforms it must not be passed. An arbitrary
+         callable, which will be passed a function and a delay in seconds::
+
+            def my_run_sync_later(fn, delay):
+                ...
+                return cancel
+
+         This callable should schedule ``fn()`` to be run by the host after
+         ``delay`` seconds, and return a zero-argument function that cancels
+         that if it hasn't happened yet. Trio uses it instead of a worker
+         thread to wait for its timeouts, because Emscripten has no threads.
+         It will only be called from the host loop's thread. For more
+         details, see :ref:`guest-run-emscripten`.
+
     For the meaning of other arguments, see `trio.run`.
 
     """
@@ -2629,6 +2699,15 @@ def start_guest_run(  # type: ignore[explicit-any]
             ),
             use_triodeprecationwarning=True,
         )
+
+    if sys.platform == "emscripten":
+        if run_sync_later is None:
+            raise TypeError(
+                "start_guest_run() requires run_sync_later= on Emscripten, "
+                "because there are no worker threads to wait for timeouts in",
+            )
+    elif run_sync_later is not None:
+        raise TypeError("run_sync_later= is only supported on Emscripten")
 
     runner = setup_runner(
         clock,
@@ -2653,7 +2732,10 @@ def start_guest_run(  # type: ignore[explicit-any]
             args,
             host_uses_signal_set_wakeup_fd=host_uses_signal_set_wakeup_fd,
         ),
+        run_sync_later=run_sync_later,
     )
+    if sys.platform == "emscripten":
+        runner.io_manager.set_guest_wakeup(guest_state.wake_up_from_host)
 
     # Run a few ticks of the guest run synchronously, so that by the
     # time we return, the system nursery exists and callers can use
@@ -3124,6 +3206,13 @@ elif TYPE_CHECKING or hasattr(select, "kqueue"):
         EventResult as EventResult,
         KqueueIOManager as TheIOManager,
         _KqueueStatistics as IOStatistics,
+    )
+elif sys.platform == "emscripten":
+    from ._generated_io_emscripten import *
+    from ._io_emscripten import (
+        EmscriptenIOManager as TheIOManager,
+        EventResult as EventResult,
+        _EmscriptenStatistics as IOStatistics,
     )
 else:  # pragma: no cover
     _patchers = sorted({"eventlet", "gevent"}.intersection(sys.modules))

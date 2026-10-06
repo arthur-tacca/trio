@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -9,6 +10,7 @@ import attrs
 
 from .. import _core
 from .._util import NoPublicConstructor, final
+from ._wakeup_emscripten import EmscriptenWakeup
 from ._wakeup_socketpair import WakeupSocketpair
 
 if TYPE_CHECKING:
@@ -18,6 +20,15 @@ if TYPE_CHECKING:
 
 Function = Callable[..., object]  # type: ignore[explicit-any]
 Job = tuple[Function, tuple[object, ...]]
+
+
+def _make_wakeup() -> WakeupSocketpair | EmscriptenWakeup:
+    # Emscripten has no socketpair, but also no threads or signals that would
+    # need one. (This is checked at call time rather than import time so that
+    # tests can exercise the Emscripten code paths on other platforms.)
+    if sys.platform == "emscripten":
+        return EmscriptenWakeup()
+    return WakeupSocketpair()
 
 
 @attrs.define
@@ -32,7 +43,7 @@ class EntryQueue:
     queue: deque[Job] = attrs.Factory(deque)
     idempotent_queue: dict[Job, None] = attrs.Factory(dict)
 
-    wakeup: WakeupSocketpair = attrs.Factory(WakeupSocketpair)
+    wakeup: WakeupSocketpair | EmscriptenWakeup = attrs.Factory(_make_wakeup)
     done: bool = False
     # Must be a reentrant lock, because it's acquired from signal handlers.
     # RLock is signal-safe as of cpython 3.2. NB that this does mean that the
