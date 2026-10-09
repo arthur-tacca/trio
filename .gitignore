@@ -84,3 +84,6 @@ node_modules/
 package.json
 package-lock.json
 pyodide-deps/
+
+# Pyodide demo page (see demo/README.md); built by demo/build_wheels.py
+demo/wheels/

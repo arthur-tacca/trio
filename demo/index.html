@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trio in the browser</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+    section { margin: 1.5rem 0; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; }
+    h2 { margin-top: 0; font-size: 1.1rem; }
+    button { margin-right: .5rem; }
+    pre { background: #f4f4f4; padding: .5rem; white-space: pre-wrap; }
+    #status { font-weight: bold; }
+    .muted { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Trio running in Pyodide</h1>
+  <p class="muted">Python's <a href="https://trio.readthedocs.io/">Trio</a>, running as a guest of the browser's event loop. Everything on this page is driven by Trio tasks.</p>
+  <p id="status">Loading…</p>
+
+  <section>
+    <h2>Concurrent tasks and sleeping</h2>
+    <p>Trio clock: <span id="clock">–</span> s</p>
+    <ul id="log"></ul>
+  </section>
+
+  <section>
+    <h2>Cancellation from a button</h2>
+    <button id="cancel-btn" disabled>Cancel the slow task</button>
+    <span id="cancel-status" class="muted">not started</span>
+  </section>
+
+  <section>
+    <h2>fetch, with Trio timeouts</h2>
+    <button id="fetch-btn" disabled>Fetch hello.txt</button>
+    <button id="fetch-cancel-btn" disabled>Stream a file, cancelled after 0.3 s</button>
+    <pre id="fetch-out"></pre>
+  </section>
+
+  <section>
+    <h2>JavaScript awaiting a Trio function</h2>
+    <button id="js-call-btn" disabled>await trioDouble(21) from JavaScript</button>
+    <span id="js-call-out" class="muted"></span>
+  </section>
+
+  <script type="module" src="demo.js"></script>
+</body>
+</html>
