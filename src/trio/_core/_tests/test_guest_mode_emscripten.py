@@ -178,6 +178,11 @@ def test_emscripten_sleep_uses_host_timers() -> None:
 
 @pytest.mark.usefixtures("emscripten_mode")
 def test_emscripten_nurseries_and_cancellation() -> None:
+    # An autojump clock keeps the order of the sleeps deterministic. With real
+    # time, a slow CI runner can let both sleeps expire before Trio's next
+    # tick, and tasks woken in the same tick run in random order.
+    clock = trio.testing.MockClock(autojump_threshold=0)
+
     async def trio_main(in_host: InHost) -> list[str]:
         record: list[str] = []
 
@@ -212,7 +217,7 @@ def test_emscripten_nurseries_and_cancellation() -> None:
 
         return record
 
-    assert emscripten_guest_run(trio_main) == [
+    assert emscripten_guest_run(trio_main, clock=clock) == [
         "fast",
         "slow",
         "timeout",
