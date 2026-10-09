@@ -25,7 +25,8 @@ try {
   pyodide.runPython(await (await fetch("demo.py")).text());
 
   // Buttons. The Python side put these functions on globalThis.
-  $("cancel-btn").onclick = () => globalThis.cancelSlowTask();
+  $("start-btn").onclick = () => globalThis.startNursery();
+  $("cancel-btn").onclick = () => globalThis.cancelNursery();
   $("fetch-btn").onclick = () => globalThis.fetchHello();
   $("fetch-cancel-btn").onclick = () => globalThis.fetchCancelled();
   $("js-call-btn").onclick = async () => {

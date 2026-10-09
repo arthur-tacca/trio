@@ -6,9 +6,9 @@ the Emscripten support on this branch. It is published with GitHub Pages at
 https://arthur-tacca.github.io/trio/ by the "Pyodide demo" workflow, which
 rebuilds the Trio wheel from the branch on every push.
 
-The page shows concurrent tasks with `trio.sleep`, cancelling a task from a
-button, `trio.pyodide.fetch` with a Trio timeout aborting a streaming fetch,
-and JavaScript awaiting a Trio async function.
+The page shows five sleeping tasks in a nursery that a button can cancel,
+`trio.pyodide.fetch` with a Trio timeout aborting a streaming fetch, and
+JavaScript awaiting a Trio async function.
 
 ## Files
 

@@ -46,35 +46,65 @@ def element(id: str) -> Any:
     return js.document.getElementById(id)
 
 
-def log(message: str) -> None:
-    item = js.document.createElement("li")
-    item.textContent = message
-    element("log").appendChild(item)
+class NurseryDemo:
+    """The Start and Cancel buttons: five sleeping tasks in one nursery."""
 
+    def __init__(self, spawner: trio.Nursery) -> None:
+        # The page's long-lived nursery, which hosts each run of the demo
+        self._spawner = spawner
+        # The demo's own nursery, while a run is in progress
+        self._nursery: trio.Nursery | None = None
+        self._running = False
+        self._start_time = 0.0
 
-async def clock() -> None:
-    start = trio.current_time()
-    while True:
-        element("clock").textContent = f"{trio.current_time() - start:.1f}"
-        await trio.sleep(0.1)
+    def start(self) -> None:
+        """Start a run, unless one is already in progress."""
+        if self._running:
+            return
+        self._running = True
+        self._spawner.start_soon(self._run)
 
+    def cancel(self) -> None:
+        """Cancel the running nursery, if there is one."""
+        if self._nursery is None:
+            return
+        self._trace("cancel requested")
+        self._nursery.cancel_scope.cancel()
 
-async def worker(name: str, delay: float) -> None:
-    for step in range(1, 4):
-        await trio.sleep(delay)
-        log(f"{name} task: step {step}, at {delay * step:.1f} s")
+    def _trace(self, message: str) -> None:
+        elapsed = trio.current_time() - self._start_time
+        item = js.document.createElement("li")
+        item.textContent = f"{elapsed:4.1f} s  {message}"
+        element("trace").appendChild(item)
 
+    async def _run(self) -> None:
+        element("trace").replaceChildren()
+        self._start_time = trio.current_time()
+        try:
+            self._trace("opening the nursery")
+            async with trio.open_nursery() as nursery:
+                self._nursery = nursery
+                for n in range(1, 6):
+                    nursery.start_soon(self._sleeper, n)
+                self._trace(
+                    "all five tasks spawned; the nursery is now waiting for them"
+                )
+            if nursery.cancel_scope.cancelled_caught:
+                self._trace("nursery finished: it was cancelled")
+            else:
+                self._trace("nursery finished: all tasks completed")
+        finally:
+            self._nursery = None
+            self._running = False
 
-async def slow_task(scope_holder: list[trio.CancelScope]) -> None:
-    with trio.CancelScope() as scope:
-        scope_holder.append(scope)
-        element("cancel-btn").disabled = False
-        element("cancel-status").textContent = "sleeping for an hour..."
-        await trio.sleep(3600)
-    element("cancel-status").textContent = (
-        "cancelled by the button; Cancelled was raised at the await"
-    )
-    element("cancel-btn").disabled = True
+    async def _sleeper(self, n: int) -> None:
+        self._trace(f"task {n} started, sleeping for {n} s")
+        try:
+            await trio.sleep(n)
+        except trio.Cancelled:
+            self._trace(f"task {n} cancelled")
+            raise
+        self._trace(f"task {n} finished")
 
 
 async def fetch_hello() -> None:
@@ -117,19 +147,22 @@ async def double(x: int) -> int:
 
 async def main() -> None:
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(clock)
-        for name, delay in [("fast", 0.3), ("medium", 0.6), ("slow", 1.0)]:
-            nursery.start_soon(worker, name, delay)
-        scope_holder: list[trio.CancelScope] = []
-        nursery.start_soon(slow_task, scope_holder)
+        demo = NurseryDemo(nursery)
 
         # Expose things for the buttons. Synchronous Trio calls are fine from
         # JavaScript event handlers; async ones go through callable_from_js.
-        js.cancelSlowTask = lambda: scope_holder[0].cancel()
+        js.startNursery = demo.start
+        js.cancelNursery = demo.cancel
         js.fetchHello = trio.pyodide.callable_from_js(nursery, fetch_hello)
         js.fetchCancelled = trio.pyodide.callable_from_js(nursery, fetch_cancelled)
         js.trioDouble = trio.pyodide.callable_from_js(nursery, double)
-        for button_id in ("fetch-btn", "fetch-cancel-btn", "js-call-btn"):
+        for button_id in (
+            "start-btn",
+            "cancel-btn",
+            "fetch-btn",
+            "fetch-cancel-btn",
+            "js-call-btn",
+        ):
             element(button_id).disabled = False
         element("status").textContent = "Trio is running"
         await trio.sleep_forever()

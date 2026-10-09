@@ -10,6 +10,7 @@
     h2 { margin-top: 0; font-size: 1.1rem; }
     button { margin-right: .5rem; }
     pre { background: #f4f4f4; padding: .5rem; white-space: pre-wrap; }
+    #trace { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; white-space: pre-wrap; }
     #status { font-weight: bold; }
     .muted { color: #666; }
   </style>
@@ -20,15 +21,11 @@
   <p id="status">Loading…</p>
 
   <section>
-    <h2>Concurrent tasks and sleeping</h2>
-    <p>Trio clock: <span id="clock">–</span> s</p>
-    <ul id="log"></ul>
-  </section>
-
-  <section>
-    <h2>Cancellation from a button</h2>
-    <button id="cancel-btn" disabled>Cancel the slow task</button>
-    <span id="cancel-status" class="muted">not started</span>
+    <h2>A nursery of sleeping tasks</h2>
+    <p class="muted">Start opens a nursery and spawns five tasks; task <i>n</i> sleeps for <i>n</i> seconds. Cancel cancels the nursery, so every task still sleeping is cancelled at its <code>await</code>. The tasks are spawned with <code>start_soon</code>, so they only begin once the parent reaches the end of the nursery block and waits, and Trio runs each batch of newly runnable tasks either forwards or backwards at random.</p>
+    <button id="start-btn" disabled>Start</button>
+    <button id="cancel-btn" disabled>Cancel</button>
+    <ul id="trace"></ul>
   </section>
 
   <section>
