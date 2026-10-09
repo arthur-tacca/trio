@@ -4,6 +4,11 @@ const PYODIDE_VERSION = "314.0.7";
 const params = new URLSearchParams(location.search);
 // ?pyodide=/pyodide/ lets a local checkout use a local copy instead of the CDN
 const indexURL = params.get("pyodide") ?? `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
+// index.html loads this file as demo.js?v=<commit> (stamped by the workflow), and
+// the same tag goes on everything fetched below, so one page load never mixes
+// files from two deploys, whatever the browser or the CDN has cached.
+const build = new URL(import.meta.url).searchParams.get("v") ?? "dev";
+const fresh = (path) => `${path}?v=${build}`;
 
 const $ = (id) => document.getElementById(id);
 const status = (text) => { $("status").textContent = text; };
@@ -14,15 +19,15 @@ try {
   const pyodide = await loadPyodide({ indexURL });
 
   status("Installing Trio…");
-  const wheels = await (await fetch("wheels/index.json")).json();
+  const wheels = await (await fetch(fresh("wheels/index.json"))).json();
   for (const name of wheels) {
-    const buffer = await (await fetch(`wheels/${name}`)).arrayBuffer();
+    const buffer = await (await fetch(fresh(`wheels/${name}`))).arrayBuffer();
     pyodide.unpackArchive(buffer, "zip", { extractDir: "/wheels" });
   }
   pyodide.runPython('import sys; sys.path.insert(0, "/wheels")');
 
   status("Starting Trio…");
-  pyodide.runPython(await (await fetch("demo.py")).text());
+  pyodide.runPython(await (await fetch(fresh("demo.py"))).text());
 
   // Buttons. The Python side put these functions on globalThis.
   $("start-btn").onclick = () => globalThis.startNursery();

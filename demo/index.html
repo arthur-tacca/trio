@@ -17,12 +17,10 @@
 </head>
 <body>
   <h1>Trio running in Pyodide</h1>
-  <p class="muted">Python's <a href="https://trio.readthedocs.io/">Trio</a>, running as a guest of the browser's event loop. Everything on this page is driven by Trio tasks.</p>
   <p id="status">Loading…</p>
 
   <section>
     <h2>A nursery of sleeping tasks</h2>
-    <p class="muted">Start opens a nursery and spawns five tasks; task <i>n</i> sleeps for <i>n</i> seconds. Cancel cancels the nursery, so every task still sleeping is cancelled at its <code>await</code>. The tasks are spawned with <code>start_soon</code>, so they only begin once the parent reaches the end of the nursery block and waits, and Trio runs each batch of newly runnable tasks either forwards or backwards at random.</p>
     <button id="start-btn" disabled>Start</button>
     <button id="cancel-btn" disabled>Cancel</button>
     <ul id="trace"></ul>
@@ -41,6 +39,8 @@
     <span id="js-call-out" class="muted"></span>
   </section>
 
-  <script type="module" src="demo.js"></script>
+  <!-- The workflow replaces __BUILD__ with the commit, so a new deploy never
+       mixes files from an older one that a browser or the CDN has cached -->
+  <script type="module" src="demo.js?v=__BUILD__"></script>
 </body>
 </html>

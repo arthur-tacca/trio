@@ -37,6 +37,9 @@ the CDN, for instance a local copy served next to the page, open
 
 `.github/workflows/pyodide-demo.yml` runs on every push to the
 `pyodide-support` branch, and on demand from the Actions tab. It runs
-`build_wheels.py` and publishes the `demo/` directory. One-time setup in the
-repository settings: under Pages, set the source to "GitHub Actions". On a
-fork, workflows must first be enabled from the Actions tab.
+`build_wheels.py`, stamps the commit into the script URL in `index.html` so
+that browsers and the CDN fetch that deploy's files rather than cached ones,
+and publishes the `demo/` directory. One-time setup in the repository
+settings: under Pages, set the source to "GitHub Actions", and under
+Environments allow the `pyodide-support` branch to deploy to `github-pages`.
+On a fork, workflows must first be enabled from the Actions tab.

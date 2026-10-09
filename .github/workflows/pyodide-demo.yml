@@ -37,6 +37,10 @@ jobs:
         run: |
           python -m pip install build
           python demo/build_wheels.py
+      - name: Stamp the page with the commit
+        # Makes browsers and the CDN fetch this deploy's files rather than cached
+        # ones from an earlier deploy; see the script tag in demo/index.html.
+        run: sed -i "s/__BUILD__/$GITHUB_SHA/g" demo/index.html
       - name: Upload the site
         uses: actions/upload-pages-artifact@v5
         with:
