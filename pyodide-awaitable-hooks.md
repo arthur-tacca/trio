@@ -202,30 +202,12 @@ Four decisions in there:
   need for a `call_method`, and `call` shrinks to a convenience around
   `abort_on_cancel`.
 
-## `py_to_js`: a coroutine JavaScript awaits becomes a task in a nursery
+## `py_to_js`: a coroutine JavaScript awaits becomes a system task
 
 ```python
 import traceback
-from contextlib import asynccontextmanager
 
 from jstypes.global_this import Promise
-
-_js_nursery: trio.Nursery | None = None
-
-
-@asynccontextmanager
-async def open_js_nursery():
-    """While open, coroutines that JavaScript awaits run as tasks here."""
-    global _js_nursery
-    if _js_nursery is not None:
-        raise RuntimeError("another open_js_nursery() is already open")
-    async with trio.open_nursery() as nursery:
-        _js_nursery = nursery
-        try:
-            yield nursery
-        finally:
-            _js_nursery = None
-
 
 _make_error = run_js(
     """
@@ -239,7 +221,7 @@ _make_error = run_js(
 )
 
 
-def _promise_for(nursery, awaitable, signal=None):
+def _promise_for(awaitable, signal=None):
     resolvers = []
     promise = Promise.new(lambda resolve, reject: resolvers.extend((resolve, reject)))
     resolve, reject = resolvers
@@ -279,42 +261,51 @@ def _promise_for(nursery, awaitable, signal=None):
             resolve(ffi.to_js(result))
 
     try:
-        nursery.start_soon(run)
-    except BaseException as exc:  # e.g. the nursery has closed
+        trio.lowlevel.spawn_system_task(run)
+    except RuntimeError as exc:  # no Trio run is active, or it has finished
         reject(_make_error(type(exc).__name__, str(exc), None))
     return promise
 
 
+def _trio_is_running():
+    try:
+        trio.lowlevel.current_trio_token()
+    except RuntimeError:
+        return False
+    return True
+
+
 def trio_py_to_js(pyawaitable):
-    if _js_nursery is None:
-        if trio.lowlevel.in_trio_task():
-            raise RuntimeError(
-                "JavaScript wants to await a Trio coroutine, but no "
-                "trio.pyodide.open_js_nursery() is open to run it in"
-            )
+    if not _trio_is_running():
         # Nothing to do with Trio: let the previous hook (asyncio) run it.
         return _previous.py_to_js(pyawaitable)
-    return _promise_for(_js_nursery, pyawaitable)
+    return _promise_for(pyawaitable)
 
 
-def callable_from_js(nursery, async_fn):
+def callable_from_js(async_fn):
     """Still useful: it is the only way for JavaScript to pass an AbortSignal."""
-    return lambda *args, signal=None: _promise_for(nursery, async_fn(*args), signal)
+    return lambda *args, signal=None: _promise_for(async_fn(*args), signal)
 ```
 
 `_promise_for` is today's `callable_from_js` body: make the promise with
-`Promise.new`, start a task in the nursery that awaits the awaitable,
-resolve with `to_js(result)`, reject with an `Error` carrying the Python
-traceback as `stack`, map an `AbortSignal` onto a cancel scope, and reject
-with `"TrioCancelled"` when Trio cancels it. Exceptions go to the
-JavaScript caller only, not to the nursery.
+`Promise.new`, start a system task that awaits the awaitable, resolve with
+`to_js(result)`, reject with an `Error` carrying the Python traceback as
+`stack`, map an `AbortSignal` onto a cancel scope, and reject with
+`"TrioCancelled"` when Trio cancels it. Exceptions go to the JavaScript
+caller only.
 
-The nursery is a module-level value rather than a context variable because
-JavaScript calls arrive in host context, outside any Trio task's context.
-Trio cannot tell a coroutine's flavour before running it, hence the policy:
-an open JS nursery claims it; otherwise it goes to the previous hook; and a
-Trio task handing a coroutine to JavaScript with no nursery open gets a
-clear error instead of asyncio's "Task got bad yield".
+The task is a system task rather than a child of some nursery, because no
+nursery is the right owner. Either the JavaScript was itself called from a
+Trio task, in which case that task's `await` already bounds the work, or
+the call came from JavaScript's own stack, in which case there is no Trio
+scope it could belong to. The JavaScript caller owns the lifetime, through
+the signal, and the end of the run cancels whatever is left.
+
+`current_trio_token()` works from host context in guest mode, which is how
+the hook tells a page with a Trio run from one without: while a run is
+active, every coroutine JavaScript awaits is taken to be Trio's. A page
+that also wants asyncio coroutines awaited from JavaScript has to wrap one
+side explicitly, because a coroutine's flavour cannot be told from outside.
 
 ## Installation, and what gets simpler
 
@@ -341,9 +332,10 @@ with abort_on_cancel(controller):
 
 - There is no way for JavaScript to pass an `AbortSignal` through a plain
   `await` of a Python coroutine, so `callable_from_js` would stay for that.
-- Flavour detection uses `trio.lowlevel.in_trio_task()`. A sniffio-style
-  "current async library" query would let the hook defer to the right
-  framework among several, rather than just to "the previous one".
+- Flavour detection is coarse: an active Trio run claims every coroutine
+  JavaScript awaits. A sniffio-style "current async library" query would
+  let the hook defer to the right framework among several, rather than
+  just to "the previous one".
 - Whether `JsAwaitable` should also offer `then`, `catch` and `finally_`
   for symmetry with the PEP's `WebFuture`; delegating them to the raw
   promise is trivial.
@@ -368,5 +360,5 @@ awaitable never to cross.
   `WebLoop`'s `setTimeout`, so it is the second choice.
 - `trio.pyodide.callable_from_js` never gives JavaScript a coroutine. It
   gives it a synchronous Python function that creates a real JavaScript
-  promise, starts the task with `nursery.start_soon`, and returns the
-  promise, so Pyodide's `ensure_future` conversion never runs.
+  promise, starts a system task, and returns the promise, so Pyodide's
+  `ensure_future` conversion never runs.

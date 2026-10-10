@@ -138,42 +138,40 @@ async def trio_main() -> dict[str, object]:
     # The JS helpers below receive the Python function as a borrowed proxy and
     # call it synchronously; the promises they return come back to Python as
     # converted promises, which is what wait_promise is for.
-    async with trio.open_nursery() as nursery:
-        start_double = trio.pyodide.callable_from_js(nursery, double)
-        promise = run_js("(start) => Promise.all([start(21), start(4)])")(start_double)
-        values = await trio.pyodide.wait_promise(promise)
-        assert values.to_py() == [42, 8], values
-        results["callable_from_js: results"] = values.to_py()
+    start_double = trio.pyodide.callable_from_js(double)
+    promise = run_js("(start) => Promise.all([start(21), start(4)])")(start_double)
+    values = await trio.pyodide.wait_promise(promise)
+    assert values.to_py() == [42, 8], values
+    results["callable_from_js: results"] = values.to_py()
 
-        promise = run_js(
-            "(start) => start().catch((e) => e.name + ': ' + e.message + ' | ' + e.stack.split('\\n')[0])",
-        )(trio.pyodide.callable_from_js(nursery, boom))
-        description = await trio.pyodide.wait_promise(promise)
-        assert (
-            description == "ValueError: boom | Traceback (most recent call last):"
-        ), description
-        results["callable_from_js: exception"] = description
+    promise = run_js(
+        "(start) => start().catch((e) => e.name + ': ' + e.message + ' | ' + e.stack.split('\\n')[0])",
+    )(trio.pyodide.callable_from_js(boom))
+    description = await trio.pyodide.wait_promise(promise)
+    assert (
+        description == "ValueError: boom | Traceback (most recent call last):"
+    ), description
+    results["callable_from_js: exception"] = description
 
-        start_forever = trio.pyodide.callable_from_js(nursery, trio.sleep_forever)
-        promise = run_js(
-            """(start) => {
-                const controller = new AbortController();
-                const promise = start.callKwargs({ signal: controller.signal });
-                setTimeout(() => controller.abort(), 20);
-                return promise.catch((e) => e.name);
-            }""",
-        )(start_forever)
-        assert await trio.pyodide.wait_promise(promise) == "AbortError"
-        results["callable_from_js: aborted from JS"] = True
+    start_forever = trio.pyodide.callable_from_js(trio.sleep_forever)
+    promise = run_js(
+        """(start) => {
+            const controller = new AbortController();
+            const promise = start.callKwargs({ signal: controller.signal });
+            setTimeout(() => controller.abort(), 20);
+            return promise.catch((e) => e.name);
+        }""",
+    )(start_forever)
+    assert await trio.pyodide.wait_promise(promise) == "AbortError"
+    results["callable_from_js: aborted from JS"] = True
 
-        promise = run_js("(start) => start().catch((e) => e.name)")(start_forever)
-        await trio.sleep(0.01)
-        nursery.cancel_scope.cancel()
-    assert await trio.pyodide.wait_promise(promise) == trio.pyodide.CANCELLED_ERROR_NAME
-    results["callable_from_js: cancelled by Trio"] = True
-    promise = run_js("(start) => start(1).catch((e) => e.name)")(start_double)
-    assert await trio.pyodide.wait_promise(promise) == "RuntimeError"
-    results["callable_from_js: after the nursery closed"] = True
+    # A call still running when the run ends is cancelled by the run ending,
+    # and a call made after that is refused. Both are checked from JavaScript
+    # once the guest run has finished: see after_run below.
+    run_js(
+        "(start) => { globalThis.pendingWhenRunEnded = start().catch((e) => e.name); }"
+    )(start_forever)
+    js.startAfterRun = create_proxy(start_double)
 
     # --- basic requests ------------------------------------------------------
     progress("basic requests")
@@ -296,6 +294,22 @@ def done_callback(outcome: Outcome[dict[str, object]]) -> None:
     print("guest run finished after", round(time.perf_counter() - started, 3), "s")
     for key, value in results.items():
         print(f"  {key}: {value}")
+    # Trio has finished, so callable_from_js's system task was cancelled with
+    # it, and a new call must be refused. JavaScript checks both and reports.
+    run_js(
+        """(pending, start, report) => {
+            pending.then((cancelled) =>
+                start(1).catch((e) => e.name).then((refused) => report(cancelled, refused)));
+        }""",
+    )(js.pendingWhenRunEnded, js.startAfterRun, create_once_callable(after_run))
+
+
+def after_run(cancelled: str, refused: str) -> None:
+    print(f"  callable_from_js: cancelled when the run ended: {cancelled}")
+    print(f"  callable_from_js: refused after the run: {refused}")
+    if cancelled != trio.pyodide.CANCELLED_ERROR_NAME or refused != "RuntimeError":
+        js.process.exitCode = 1
+        return
     print("PYODIDE TEST PASSED")
 
 

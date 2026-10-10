@@ -448,10 +448,9 @@ async def test_callable_from_js_result(trio_pyodide: ModuleType) -> None:
         return x * 2
 
     record: list[tuple[str, object]] = []
-    async with trio.open_nursery() as nursery:
-        start = trio_pyodide.callable_from_js(nursery, double)
-        js_awaits(start(21), record)
-        js_awaits(start(4), record)
+    start = trio_pyodide.callable_from_js(double)
+    js_awaits(start(21), record)
+    js_awaits(start(4), record)
     await trio.testing.wait_all_tasks_blocked()
     assert sorted(record, key=repr) == [("fulfilled", 42), ("fulfilled", 8)]
 
@@ -462,9 +461,8 @@ async def test_callable_from_js_exception(trio_pyodide: ModuleType) -> None:
         raise ValueError("boom")
 
     record: list[tuple[str, object]] = []
-    async with trio.open_nursery() as nursery:
-        js_awaits(trio_pyodide.callable_from_js(nursery, boom)(), record)
-    # ...and the nursery wasn't crashed by it
+    js_awaits(trio_pyodide.callable_from_js(boom)(), record)
+    # ...and the run survives it, which a system task raising would not allow
     await trio.testing.wait_all_tasks_blocked()
     [(kind, error)] = record
     assert kind == "rejected"
@@ -478,13 +476,12 @@ async def test_callable_from_js_exception(trio_pyodide: ModuleType) -> None:
 async def test_callable_from_js_abort_from_js(trio_pyodide: ModuleType) -> None:
     controller = FakeAbortController()
     record: list[tuple[str, object]] = []
-    async with trio.open_nursery() as nursery:
-        start = trio_pyodide.callable_from_js(nursery, trio.sleep_forever)
-        js_awaits(start(signal=controller.signal), record)
-        await trio.testing.wait_all_tasks_blocked()
-        assert record == []
-        assert len(controller.signal.listeners) == 1
-        controller.abort()
+    start = trio_pyodide.callable_from_js(trio.sleep_forever)
+    js_awaits(start(signal=controller.signal), record)
+    await trio.testing.wait_all_tasks_blocked()
+    assert record == []
+    assert len(controller.signal.listeners) == 1
+    controller.abort()
     await trio.testing.wait_all_tasks_blocked()
     assert record == [("rejected", controller.signal.reason)]
     # the abort listener was cleaned up
@@ -495,38 +492,43 @@ async def test_callable_from_js_already_aborted(trio_pyodide: ModuleType) -> Non
     controller = FakeAbortController()
     controller.abort()
     record: list[tuple[str, object]] = []
-    async with trio.open_nursery() as nursery:
-        start = trio_pyodide.callable_from_js(nursery, trio.sleep_forever)
-        js_awaits(start(signal=controller.signal), record)
+    start = trio_pyodide.callable_from_js(trio.sleep_forever)
+    js_awaits(start(signal=controller.signal), record)
     await trio.testing.wait_all_tasks_blocked()
     assert record == [("rejected", controller.signal.reason)]
 
 
-async def test_callable_from_js_cancelled_by_trio(trio_pyodide: ModuleType) -> None:
+def test_callable_from_js_cancelled_when_the_run_ends(
+    trio_pyodide: ModuleType,
+) -> None:
     controller = FakeAbortController()
-    record: list[tuple[str, object]] = []
-    async with trio.open_nursery() as nursery:
-        start = trio_pyodide.callable_from_js(nursery, trio.sleep_forever)
-        js_awaits(start(signal=controller.signal), record)
-        js_awaits(start(), record)
+    promises: list[object] = []
+
+    async def main() -> None:
+        start = trio_pyodide.callable_from_js(trio.sleep_forever)
+        promises.append(start(signal=controller.signal))
+        promises.append(start())
         await trio.testing.wait_all_tasks_blocked()
-        nursery.cancel_scope.cancel()
-    await trio.testing.wait_all_tasks_blocked()
-    assert len(record) == 2
-    for kind, error in record:
+        # Returning ends the run, which cancels the system tasks on its way out
+
+    trio.run(main)
+    assert len(promises) == 2
+    for promise in promises:
+        assert isinstance(promise, FakePromise)
+        assert promise.outcome is not None
+        kind, error = promise.outcome
         assert kind == "rejected"
         assert isinstance(error, FakeJsError)
         assert error.name == trio_pyodide.CANCELLED_ERROR_NAME
     assert controller.signal.listeners == []
 
 
-async def test_callable_from_js_after_nursery_closed(trio_pyodide: ModuleType) -> None:
-    async with trio.open_nursery() as nursery:
-        start = trio_pyodide.callable_from_js(nursery, trio.sleep)
-    record: list[tuple[str, object]] = []
-    js_awaits(start(0), record)
-    await trio.testing.wait_all_tasks_blocked()
-    [(kind, error)] = record
+def test_callable_from_js_without_a_run(trio_pyodide: ModuleType) -> None:
+    start = trio_pyodide.callable_from_js(trio.sleep)
+    promise = start(0)
+    assert isinstance(promise, FakePromise)
+    assert promise.outcome is not None
+    kind, error = promise.outcome
     assert kind == "rejected"
     assert isinstance(error, FakeJsError)
     assert error.name == "RuntimeError"

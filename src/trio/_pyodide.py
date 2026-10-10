@@ -283,29 +283,32 @@ def _error_from_exception(exc: BaseException) -> object:
 
 
 def callable_from_js(
-    nursery: trio.Nursery,
     async_fn: Callable[..., Awaitable[object]],
 ) -> Callable[..., object]:
     """Return a function that JavaScript can call to run ``async_fn``.
 
-    Each call starts ``async_fn(*args)`` as a task in ``nursery``, and
+    Each call starts ``async_fn(*args)`` as a Trio system task and
     immediately returns a JavaScript ``Promise``, which is fulfilled with the
     task's return value (converted with `pyodide.ffi.to_js`) or rejected if
-    it raises. Exceptions are delivered to the JavaScript caller only; they
-    don't crash the nursery. A rejection is a JavaScript ``Error`` whose
-    ``name`` is the Python exception type's name, and whose ``stack`` is the
-    Python traceback.
+    it raises. Exceptions are delivered to the JavaScript caller only: a
+    rejection is a JavaScript ``Error`` whose ``name`` is the Python
+    exception type's name, and whose ``stack`` is the Python traceback.
 
     JavaScript can pass an ``AbortSignal`` as the ``signal`` keyword argument
     (with ``callKwargs``, since it's a keyword argument). Aborting it cancels
-    the task, and the promise is rejected with the signal's reason. If the
-    task is cancelled by Trio instead, say because the nursery is cancelled,
-    the promise is rejected with an ``Error`` named ``"TrioCancelled"``.
+    the task, and the promise is rejected with the signal's reason.
+
+    The task belongs to no nursery of yours: JavaScript chose to make the
+    call, so JavaScript owns its lifetime, through that signal. The only
+    other thing that cancels it is the end of the Trio run, which cancels
+    every system task; the promise is then rejected with an ``Error`` named
+    ``"TrioCancelled"``. A call made while no Trio run is active is rejected
+    with a ``RuntimeError``. Like any system task, it runs with
+    :exc:`KeyboardInterrupt` protection enabled.
 
     The returned function is a plain Python function. To let JavaScript keep
     hold of it, assign it to a JavaScript object (``js.myApp.doThing =
     ...``), or wrap it with `pyodide.ffi.create_proxy`.
-
     """
 
     def start(*args: object, signal: object = None) -> object:
@@ -346,9 +349,9 @@ def callable_from_js(
                 resolve(to_js(result))
 
         try:
-            nursery.start_soon(run)
-        except BaseException as exc:
-            # e.g. the nursery has already closed
+            trio.lowlevel.spawn_system_task(run, name=async_fn)
+        except RuntimeError as exc:
+            # No Trio run is active, or it has finished
             reject(_error_from_exception(exc))
         return promise
 

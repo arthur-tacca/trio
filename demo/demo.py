@@ -153,9 +153,9 @@ async def main() -> None:
         # JavaScript event handlers; async ones go through callable_from_js.
         js.startNursery = demo.start
         js.cancelNursery = demo.cancel
-        js.fetchHello = trio.pyodide.callable_from_js(nursery, fetch_hello)
-        js.fetchCancelled = trio.pyodide.callable_from_js(nursery, fetch_cancelled)
-        js.trioDouble = trio.pyodide.callable_from_js(nursery, double)
+        js.fetchHello = trio.pyodide.callable_from_js(fetch_hello)
+        js.fetchCancelled = trio.pyodide.callable_from_js(fetch_cancelled)
+        js.trioDouble = trio.pyodide.callable_from_js(double)
         for button_id in (
             "start-btn",
             "cancel-btn",
