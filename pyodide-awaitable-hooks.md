@@ -51,7 +51,6 @@ The code uses the PEP's names (`jstypes.ffi`, `jstypes.code.run_js`,
 ## `js_to_py`: a promise becomes a Trio awaitable around the raw promise
 
 ```python
-import contextvars
 import itertools
 from contextlib import contextmanager
 
@@ -79,8 +78,8 @@ _attach = run_js(
 # through Python comes back wrapped in a PythonError.
 _abort_with_cancellation = run_js(
     """
-    (controller, name) => {
-        const error = new Error("the Trio task waiting for this operation was cancelled");
+    (controller, name, message) => {
+        const error = new Error(message);
         error.name = name;
         controller.abort(error);
     }
@@ -90,23 +89,40 @@ _abort_with_cancellation = run_js(
 _pending: dict[int, "JsAwaitable"] = {}
 _tokens = itertools.count()
 
-# Which AbortController a cancelled await should abort. A context variable,
-# so it scopes to the task and to a `with` block.
-_abort_controller: contextvars.ContextVar[object] = contextvars.ContextVar(
-    "trio_js_abort_controller", default=None
-)
+# The AbortControllers of the abort_signal() blocks each task is inside,
+# innermost last. Keyed by task rather than kept in a context variable:
+# context variables are copied into child tasks, and a child cancelled on
+# its own must not abort its parent's operations.
+_controllers: dict[trio.lowlevel.Task, list] = {}
+
+
+def _current_controller():
+    try:
+        task = trio.lowlevel.current_task()
+    except RuntimeError:
+        return None
+    stack = _controllers.get(task)
+    return stack[-1] if stack else None
 
 
 @contextmanager
-def abort_on_cancel(controller):
-    """Cancelling the task while it awaits a JavaScript promise inside this
-    block aborts ``controller``, with an Error named "TrioCancelled"."""
-    reset = _abort_controller.set(controller)
+def abort_signal():
+    """An AbortSignal that cancelling the task aborts. Pass it to the
+    JavaScript operations awaited inside the block. Leaving the block aborts
+    it too, so nothing given the signal outlives the block."""
+    task = trio.lowlevel.current_task()
+    controller = run_js("new AbortController()")
+    _controllers.setdefault(task, []).append(controller)
     try:
-        yield
+        yield controller.signal
     finally:
-        _abort_controller.reset(reset)
-
+        _controllers[task].pop()
+        if not _controllers[task]:
+            del _controllers[task]
+        if not controller.signal.aborted:
+            _abort_with_cancellation(
+                controller, CANCELLED_ERROR_NAME, "the abort_signal() block has ended"
+            )
 
 def _settle(token, fulfilled, value):
     # A microtask on the host loop, between guest ticks: the "host wakes a
@@ -144,7 +160,7 @@ class JsAwaitable:
             # that was installed before ours. done_callback is already taken
             # care of, so don't pass it again.
             return _previous.js_to_py(self.promise, None).__await__()
-        return self._wait(_abort_controller.get()).__await__()
+        return self._wait(_current_controller()).__await__()
 
     async def _wait(self, controller):
         raise_cancel = None
@@ -155,7 +171,11 @@ class JsAwaitable:
                 nonlocal raise_cancel
                 raise_cancel = raise_cancel_
                 if controller is not None:
-                    _abort_with_cancellation(controller, CANCELLED_ERROR_NAME)
+                    _abort_with_cancellation(
+                        controller,
+                        CANCELLED_ERROR_NAME,
+                        "the Trio task waiting for this operation was cancelled",
+                    )
                 # Cancellation surfaces when the promise settles, not before
                 return trio.lowlevel.Abort.FAILED
 
@@ -191,16 +211,18 @@ Four decisions in there:
 - **A promise that settles before it is awaited is handled**, by storing
   the outcome and re-delivering it. That also gives Future-like multiple
   awaits.
-- **Cancellation reads the controller from a context variable**, so plain
-  `await js.fetch(url, signal=controller.signal)` inside
-  `with abort_on_cancel(controller):` behaves exactly like today's
-  `trio.pyodide.call(..., abort_controller=controller)`: the task keeps
-  waiting until the promise settles, and the cancellation is delivered when
-  the rejection caused by the abort arrives. If the operation ignores the
-  signal and completes anyway, the task gets its value.
-- **The FFI calls the function and binds `this` itself**, so there is no
-  need for a `call_method`, and `call` shrinks to a convenience around
-  `abort_on_cancel`.
+- **Cancellation finds the signal through the task**, so plain
+  `await js.fetch(url, signal=signal)` inside `with abort_signal() as
+  signal:` behaves exactly like today's `trio.pyodide.call` inside the same
+  block: the task keeps waiting until the promise settles, and the
+  cancellation is delivered when the rejection caused by the abort arrives.
+  If the operation ignores the signal and completes anyway, the task gets
+  its value. The block hands out the only reference to the signal, so the
+  signal an operation is given and the controller a cancellation aborts
+  cannot disagree.
+- **The FFI calls the function and binds `this` itself**, so neither
+  `call_method` nor `call` is needed; `abort_signal` is all Trio adds on
+  this side.
 
 ## `py_to_js`: a coroutine JavaScript awaits becomes a system task
 
@@ -322,9 +344,8 @@ With the hooks in place, `wait_promise`, `call_method` and the JavaScript
 call helper all disappear from `trio.pyodide`, and `fetch` becomes
 
 ```python
-controller = run_js("new AbortController()")
-with abort_on_cancel(controller):
-    response = await js.fetch(url, init)   # init.signal = controller.signal
+with abort_signal() as signal:
+    response = await js.fetch(url, signal=signal)
     text = await response.text()
 ```
 

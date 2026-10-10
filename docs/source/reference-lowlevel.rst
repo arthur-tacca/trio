@@ -1111,36 +1111,44 @@ implement ``run_sync_soon`` instead.)
 trio.pyodide`` gives you these. (The module isn't documented with
 autodoc, because it can only be imported under Pyodide.)
 
-``await trio.pyodide.call(function, *args, abort_controller=None)``
-calls a JavaScript function, waits for the promise it returns if it
-returns one, and gives you the result. ``await
-trio.pyodide.call_method(obj, name, *args, abort_controller=None)``
-does the same for a method, with ``obj`` as ``this``. If the function
-throws, or its promise is rejected, with a JavaScript ``Error``, that's
-raised, as a `pyodide.ffi.JsException`; anything else it's rejected
-with is wrapped in ``trio.pyodide.JsPromiseRejected``.
+``await trio.pyodide.call(function, *args)`` calls a JavaScript
+function, waits for the promise it returns if it returns one, and
+gives you the result. ``await trio.pyodide.call_method(obj, name,
+*args)`` does the same for a method, with ``obj`` as ``this``. If the
+function throws, or its promise is rejected, with a JavaScript
+``Error``, that's raised, as a `pyodide.ffi.JsException`; anything
+else it's rejected with is wrapped in ``trio.pyodide.JsPromiseRejected``.
 
 These call the function from JavaScript, so that its promise never
 reaches Python. That matters: Pyodide turns every promise that reaches
 Python into an `asyncio.Future`. Awaiting one of those from a Trio task
 doesn't work, and handing it back to JavaScript gives you a different,
 derived promise. If you already have such a converted promise, ``await
-trio.pyodide.wait_promise(promise, abort_controller=None)`` waits for
-it, through the future's ``then`` method, with the same results and
-cancellation behaviour as `call`.
+trio.pyodide.wait_promise(promise)`` waits for it, through the
+future's ``then`` method, with the same results and cancellation
+behaviour as `call`.
 
 JavaScript promises can't be cancelled, so cancelling a task that's
 waiting on one doesn't interrupt it: the task keeps waiting until the
-promise settles. But if you pass an ``AbortController`` whose signal
-the operation respects, then the cancellation aborts it, with a
-JavaScript ``Error`` whose ``name`` is ``"TrioCancelled"`` (also
-available as ``trio.pyodide.CANCELLED_ERROR_NAME``). When the promise
-is then rejected because of that abort, the task's `~trio.Cancelled`
-is raised. If the promise is fulfilled anyway, the value is returned,
-and the cancellation is delivered at the task's next checkpoint. The
-same thing happens if you abort the controller yourself while the task
-is cancelled; if you abort it while the task *isn't* cancelled, the
-``AbortError`` is raised like any other rejection.
+promise settles. To let the cancellation interrupt the operation, make
+the call inside a ``trio.pyodide.abort_signal()`` block, and give the
+operation the block's ``AbortSignal``::
+
+   with trio.pyodide.abort_signal() as signal:
+       result = await trio.pyodide.call(js.someAsyncFunction, arg, signal)
+
+If the task is cancelled while waiting inside the block, the signal is
+aborted, with a JavaScript ``Error`` whose ``name`` is
+``"TrioCancelled"`` (also available as
+``trio.pyodide.CANCELLED_ERROR_NAME``). When the promise is then
+rejected because of that abort, the task's `~trio.Cancelled` is
+raised. If the promise is fulfilled anyway, the value is returned, and
+the cancellation is delivered at the task's next checkpoint. An
+``AbortError`` that arrives while the task *isn't* cancelled is raised
+like any other rejection. Leaving the block aborts the signal if that
+hasn't happened yet, so nothing you gave it to outlives the block.
+Blocks nest, and a signal isn't inherited by tasks started inside its
+block.
 
 In the other direction, ``trio.pyodide.callable_from_js(async_fn)``
 returns a function that JavaScript can call. Each call starts

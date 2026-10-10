@@ -124,6 +124,22 @@ async def trio_main() -> dict[str, object]:
     )
     results["wait_promise: rejected with an Error"] = f"RangeError: {message}"
 
+    # --- abort_signal --------------------------------------------------------
+    progress("abort_signal")
+    rejects_on_abort = run_js(
+        "(signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)))",
+    )
+    with trio.move_on_after(0.05) as scope:
+        with trio.pyodide.abort_signal() as signal:
+            await trio.pyodide.call(rejects_on_abort, signal)
+    assert scope.cancelled_caught
+    assert signal.aborted
+    assert signal.reason.name == trio.pyodide.CANCELLED_ERROR_NAME, signal.reason
+    results["abort_signal: cancellation aborted the signal"] = signal.reason.name
+    with trio.pyodide.abort_signal() as signal:
+        pass
+    results["abort_signal: aborted on leaving the block"] = signal.aborted
+
     # --- callable_from_js ----------------------------------------------------
     progress("callable_from_js")
 

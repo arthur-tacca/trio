@@ -89,13 +89,13 @@ class FakePromise:
     """Settles asynchronously, like a real promise: callbacks run as
     run_sync_soon jobs, which stand in for JavaScript microtasks."""
 
-    def __init__(self, respects: FakeAbortController | None = None) -> None:
+    def __init__(self, respects: FakeSignal | None = None) -> None:
         self.callbacks: list[
             tuple[Callable[[object], object], Callable[[object], object]]
         ] = []
         self.outcome: tuple[str, object] | None = None
         if respects is not None:
-            respects.signal.listeners.append(self.reject)
+            respects.listeners.append(self.reject)
 
     @staticmethod
     def new(
@@ -281,16 +281,13 @@ async def test_call_cancellation(
     trio_pyodide: ModuleType,
     autojump_clock: trio.testing.MockClock,
 ) -> None:
-    controller = FakeAbortController()
     # like fetch: rejects with the signal's reason when the signal is aborted
     with trio.move_on_after(1) as cancel_scope:
-        await trio_pyodide.call(
-            lambda: FakePromise(respects=controller),
-            abort_controller=controller,
-        )
+        with trio_pyodide.abort_signal() as signal:
+            await trio_pyodide.call(lambda: FakePromise(respects=signal))
     assert cancel_scope.cancelled_caught
-    assert controller.signal.reason is not None
-    assert controller.signal.reason.name == trio_pyodide.CANCELLED_ERROR_NAME
+    assert signal.reason is not None
+    assert signal.reason.name == trio_pyodide.CANCELLED_ERROR_NAME
 
 
 async def test_wait_promise(trio_pyodide: ModuleType) -> None:
@@ -310,14 +307,13 @@ async def test_cancellation_aborts_and_surfaces_when_the_promise_rejects(
     trio_pyodide: ModuleType,
     autojump_clock: trio.testing.MockClock,
 ) -> None:
-    controller = FakeAbortController()
-    promise = FakePromise(respects=controller)
     with trio.move_on_after(1) as cancel_scope:
-        await trio_pyodide.wait_promise(promise, abort_controller=controller)
+        with trio_pyodide.abort_signal() as signal:
+            await trio_pyodide.wait_promise(FakePromise(respects=signal))
     assert cancel_scope.cancelled_caught
-    assert controller.signal.aborted
-    assert controller.signal.reason is not None
-    assert controller.signal.reason.name == trio_pyodide.CANCELLED_ERROR_NAME
+    assert signal.aborted
+    assert signal.reason is not None
+    assert signal.reason.name == trio_pyodide.CANCELLED_ERROR_NAME
 
 
 async def test_cancellation_waits_for_the_promise(
@@ -326,21 +322,21 @@ async def test_cancellation_waits_for_the_promise(
 ) -> None:
     # The promise ignores the abort signal, so cancelling the task can't
     # interrupt it: the task keeps waiting, and gets the eventual value.
-    controller = FakeAbortController()
     promise = FakePromise()
     record: list[object] = []
+    signals: list[FakeSignal] = []
 
     async def waiter() -> None:
         with trio.move_on_after(1) as cancel_scope:
-            record.append(
-                await trio_pyodide.call(lambda: promise, abort_controller=controller)
-            )
+            with trio_pyodide.abort_signal() as signal:
+                signals.append(signal)
+                record.append(await trio_pyodide.call(lambda: promise))
         record.append(("cancelled_caught", cancel_scope.cancelled_caught))
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(waiter)
         await trio.sleep(2)
-        assert controller.signal.aborted
+        assert signals[0].aborted
         assert record == []
         promise.resolve("late value")
         await trio.testing.wait_all_tasks_blocked()
@@ -348,7 +344,7 @@ async def test_cancellation_waits_for_the_promise(
     assert record == ["late value", ("cancelled_caught", False)]
 
 
-async def test_cancellation_without_abort_controller(
+async def test_cancellation_outside_an_abort_signal_block(
     trio_pyodide: ModuleType,
     autojump_clock: trio.testing.MockClock,
 ) -> None:
@@ -374,36 +370,41 @@ async def test_cancelled_then_rejected_with_something_else(
     # If the operation fails for its own reasons after we asked it to abort,
     # that failure is what gets raised; the cancellation waits for the next
     # checkpoint.
-    controller = FakeAbortController()
     promise = FakePromise()
     error = FakeJsError("disk on fire", "TypeError")
+    signals: list[FakeSignal] = []
 
     async def waiter() -> None:
         with trio.move_on_after(1):
-            await trio_pyodide.wait_promise(promise, abort_controller=controller)
+            with trio_pyodide.abort_signal() as signal:
+                signals.append(signal)
+                await trio_pyodide.wait_promise(promise)
 
     with pytest.RaisesGroup(pytest.RaisesExc(check=lambda exc: exc is error)):
         async with trio.open_nursery() as nursery:
             nursery.start_soon(waiter)
             await trio.sleep(2)
-            assert controller.signal.aborted
+            assert signals[0].aborted
             promise.reject(error)
 
 
 async def test_foreign_abort_is_an_error(trio_pyodide: ModuleType) -> None:
-    # Somebody else aborting the controller isn't a Trio cancellation
-    controller = FakeAbortController()
-    promise = FakePromise(respects=controller)
+    # The operation being aborted on the JavaScript side, for its own
+    # reasons, isn't a Trio cancellation
+    promise = FakePromise()
 
     async def waiter() -> None:
-        with pytest.raises(FakeJsError, match="This operation was aborted") as excinfo:
-            await trio_pyodide.wait_promise(promise, abort_controller=controller)
-        assert excinfo.value.name == "AbortError"
+        with trio_pyodide.abort_signal():
+            with pytest.raises(
+                FakeJsError, match="This operation was aborted"
+            ) as excinfo:
+                await trio_pyodide.wait_promise(promise)
+            assert excinfo.value.name == "AbortError"
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(waiter)
         await trio.testing.wait_all_tasks_blocked()
-        controller.abort()
+        promise.reject(FakeJsError("This operation was aborted", "AbortError"))
 
 
 async def test_cancelled_and_foreign_abort(
@@ -412,7 +413,6 @@ async def test_cancelled_and_foreign_abort(
 ) -> None:
     # A plain AbortError after we've asked for an abort still counts as our
     # cancellation
-    controller = FakeAbortController()
     promise = FakePromise()
     with trio.move_on_after(1) as cancel_scope:
 
@@ -424,8 +424,59 @@ async def test_cancelled_and_foreign_abort(
 
         async with trio.open_nursery() as nursery:
             nursery.start_soon(abort_from_js)
-            await trio_pyodide.wait_promise(promise, abort_controller=controller)
+            with trio_pyodide.abort_signal():
+                await trio_pyodide.wait_promise(promise)
     assert cancel_scope.cancelled_caught
+
+
+async def test_abort_signal_aborts_on_exit(trio_pyodide: ModuleType) -> None:
+    with trio_pyodide.abort_signal() as signal:
+        assert isinstance(signal, FakeSignal)
+        assert not signal.aborted
+    assert signal.aborted
+    assert signal.reason is not None
+    assert signal.reason.name == trio_pyodide.CANCELLED_ERROR_NAME
+
+
+async def test_abort_signal_nesting(
+    trio_pyodide: ModuleType,
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    with trio_pyodide.abort_signal() as outer:
+        with trio.move_on_after(1):
+            with trio_pyodide.abort_signal() as inner:
+                await trio_pyodide.call(lambda: FakePromise(respects=inner))
+        # The cancellation aborted the innermost block's signal only
+        assert inner.aborted
+        assert not outer.aborted
+    assert outer.aborted
+
+
+async def test_abort_signal_not_inherited_by_child_tasks(
+    trio_pyodide: ModuleType,
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    promise = FakePromise()
+
+    async def child() -> None:
+        with trio.move_on_after(1):
+            await trio_pyodide.call(lambda: promise)
+
+    with trio_pyodide.abort_signal() as signal:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(child)
+            await trio.sleep(2)
+            # The child was cancelled, but it had no signal of its own, so
+            # the parent's wasn't touched
+            assert not signal.aborted
+            promise.resolve(None)
+    assert signal.aborted
+
+
+def test_abort_signal_needs_a_task(trio_pyodide: ModuleType) -> None:
+    with pytest.raises(RuntimeError, match="async context"):
+        with trio_pyodide.abort_signal():
+            pass  # pragma: no cover
 
 
 ################################################################

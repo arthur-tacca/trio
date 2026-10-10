@@ -20,6 +20,7 @@ assert not TYPE_CHECKING or sys.platform == "emscripten"
 import itertools
 import json
 import traceback
+from contextlib import contextmanager
 from typing import Final, NamedTuple
 
 import js
@@ -33,7 +34,7 @@ from ._abc import ReceiveStream
 from ._util import final
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Iterator, Mapping
 
     from typing_extensions import Self
 
@@ -48,6 +49,9 @@ if TYPE_CHECKING:
 # kind of error.
 CANCELLED_ERROR_NAME: Final = "TrioCancelled"
 _CANCELLED_MESSAGE: Final = "the Trio task waiting for this operation was cancelled"
+_BLOCK_ENDED_MESSAGE: Final = (
+    "the trio.pyodide.abort_signal() block that made this signal has ended"
+)
 
 
 class JsPromiseRejected(Exception):
@@ -138,6 +142,72 @@ def _is_abort(reason: object) -> bool:
     return getattr(reason, "name", None) in (CANCELLED_ERROR_NAME, "AbortError")
 
 
+################################################################
+# Cancellation: abort_signal()
+################################################################
+
+# The AbortControllers of the abort_signal() blocks each task is inside,
+# innermost last. This is keyed by task rather than kept in a context
+# variable, because context variables are copied into child tasks, and a
+# child cancelled on its own must not abort its parent's operations.
+_controllers: dict[trio.lowlevel.Task, list[object]] = {}
+
+
+def _current_controller() -> object:
+    try:
+        task = trio.lowlevel.current_task()
+    except RuntimeError:
+        return None
+    stack = _controllers.get(task)
+    return stack[-1] if stack else None
+
+
+@contextmanager
+def abort_signal() -> Iterator[object]:
+    """Make an ``AbortSignal`` that cancelling the task aborts.
+
+    Use it as a context manager, and pass the signal it gives you to the
+    JavaScript operations you call inside the block::
+
+        with trio.pyodide.abort_signal() as signal:
+            result = await trio.pyodide.call(js.someAsyncFunction, arg, signal)
+
+    If the task is cancelled while it's waiting, inside the block, for a
+    JavaScript operation (with `call`, `call_method` or `wait_promise`), the
+    signal is aborted, with a JavaScript ``Error`` named ``"TrioCancelled"``
+    (`CANCELLED_ERROR_NAME`). An operation that respects the signal then
+    rejects its promise, and the task's `~trio.Cancelled` is raised once that
+    rejection arrives. An operation that ignores the signal runs to
+    completion, the task gets its value, and the cancellation is delivered
+    at the next checkpoint. An ``AbortError`` that arrives while the task
+    isn't cancelled is raised like any other rejection.
+
+    Leaving the block aborts the signal too, if that hasn't happened yet, so
+    nothing you gave the signal to outlives the block. Blocks nest: an
+    operation waited for inside the innermost block uses that block's
+    signal. The signal belongs to the task that made it, and isn't inherited
+    by tasks started inside the block.
+
+    """
+    task = trio.lowlevel.current_task()
+    controller = js.AbortController.new()
+    _controllers.setdefault(task, []).append(controller)
+    try:
+        yield controller.signal
+    finally:
+        stack = _controllers[task]
+        popped = stack.pop()
+        assert popped is controller
+        if not stack:
+            del _controllers[task]
+        if not controller.signal.aborted:
+            _abort_with_cancellation(
+                controller,
+                CANCELLED_ERROR_NAME,
+                _BLOCK_ENDED_MESSAGE,
+            )
+
+
 async def _wait_for_settlement(token: int, abort_controller: object) -> object:
     raise_cancel: RaiseCancelT | None = None
 
@@ -179,11 +249,7 @@ async def _call(
     return await _wait_for_settlement(token, abort_controller)
 
 
-async def call(
-    function: object,
-    *args: object,
-    abort_controller: object = None,
-) -> object:
+async def call(function: object, *args: object) -> object:
     """Call a JavaScript function and wait for its result.
 
     The function is called in JavaScript with the given arguments (converted
@@ -196,27 +262,18 @@ async def call(
     anything else it's rejected with is wrapped in `JsPromiseRejected`.
 
     JavaScript promises can't be cancelled, so if the task waiting here is
-    cancelled, it keeps waiting until the promise settles. But if you pass an
-    ``AbortController`` (the JavaScript object) whose signal the operation
-    respects, then cancelling the task aborts it, with a JavaScript ``Error``
-    named ``"TrioCancelled"``. If the promise is then rejected because of that
-    abort, the task's `~trio.Cancelled` is raised here. If the promise is
-    fulfilled anyway, the value is returned as usual, and the cancellation is
-    delivered at the task's next checkpoint.
+    cancelled, it keeps waiting until the promise settles. To let the
+    cancellation interrupt the operation, make the call inside an
+    `abort_signal` block and give the operation the block's signal.
 
     This calls the function as a plain function. For a method, which needs
     its object as ``this``, use `call_method`.
 
     """
-    return await _call(function, None, args, abort_controller)
+    return await _call(function, None, args, _current_controller())
 
 
-async def call_method(
-    obj: object,
-    name: str,
-    *args: object,
-    abort_controller: object = None,
-) -> object:
+async def call_method(obj: object, name: str, *args: object) -> object:
     """Call a method of a JavaScript object and wait for its result.
 
     Like `call`, but calls ``obj[name](*args)`` with ``obj`` as ``this``.
@@ -225,10 +282,10 @@ async def call_method(
     JavaScript.)
 
     """
-    return await _call(obj, name, args, abort_controller)
+    return await _call(obj, name, args, _current_controller())
 
 
-async def wait_promise(promise: object, *, abort_controller: object = None) -> object:
+async def wait_promise(promise: object) -> object:
     """Wait for a JavaScript promise that you already have, and return the
     value it was fulfilled with.
 
@@ -236,8 +293,8 @@ async def wait_promise(promise: object, *, abort_controller: object = None) -> o
     promise reaches Python, Pyodide has turned it into an `asyncio.Future`:
     this function works through that future's ``then`` method, and as of
     Pyodide 0.28 the conversion itself fails for a promise that's rejected
-    with something that isn't an ``Error``. Rejections, cancellation and
-    ``abort_controller`` otherwise behave as for `call`.
+    with something that isn't an ``Error``. Rejections and cancellation
+    otherwise behave as for `call`.
 
     Don't ``await`` a promise directly from a Trio task: Pyodide's ``await``
     support for promises is built on asyncio and won't work.
@@ -253,7 +310,7 @@ async def wait_promise(promise: object, *, abort_controller: object = None) -> o
     except BaseException:
         del _waiting[token]
         raise
-    return await _wait_for_settlement(token, abort_controller)
+    return await _wait_for_settlement(token, _current_controller())
 
 
 ################################################################
@@ -403,11 +460,7 @@ class ResponseBody(ReceiveStream):
                 # getReader() locks the stream, so only do it once we're
                 # actually going to read
                 self._reader = self._js_response.body.getReader()
-            result = await call_method(
-                self._reader,
-                "read",
-                abort_controller=self._abort_controller,
-            )
+            result = await _call(self._reader, "read", (), self._abort_controller)
             if self._closed:
                 raise trio.ClosedResourceError
             if result.done:
@@ -466,11 +519,7 @@ class Response:
     async def text(self) -> str:
         """Read the whole body, decoded as text."""
         _check_not_aborted(self._abort_controller)
-        return await call_method(
-            self._js_response,
-            "text",
-            abort_controller=self._abort_controller,
-        )
+        return await _call(self._js_response, "text", (), self._abort_controller)
 
     async def json(self) -> object:
         """Read the whole body and parse it as JSON."""
@@ -479,10 +528,8 @@ class Response:
     async def bytes(self) -> bytes:
         """Read the whole body as bytes."""
         _check_not_aborted(self._abort_controller)
-        buffer = await call_method(
-            self._js_response,
-            "arrayBuffer",
-            abort_controller=self._abort_controller,
+        buffer = await _call(
+            self._js_response, "arrayBuffer", (), self._abort_controller
         )
         return buffer.to_bytes()
 
@@ -533,5 +580,5 @@ async def fetch(
         )
     for key, value in options.items():
         setattr(init, key, value)
-    js_response = await call(js.fetch, url, init, abort_controller=abort_controller)
+    js_response = await _call(js.fetch, None, (url, init), abort_controller)
     return Response(js_response, abort_controller)

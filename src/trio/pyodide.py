@@ -15,6 +15,7 @@ from ._pyodide import (
     JsPromiseRejected as JsPromiseRejected,
     Response as Response,
     ResponseBody as ResponseBody,
+    abort_signal as abort_signal,
     call as call,
     call_method as call_method,
     callable_from_js as callable_from_js,
