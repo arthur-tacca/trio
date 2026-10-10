@@ -243,50 +243,37 @@ _make_error = run_js(
 )
 
 
-def _promise_for(awaitable, signal=None):
+def _promise_for(awaitable):
     resolvers = []
     promise = Promise.new(lambda resolve, reject: resolvers.extend((resolve, reject)))
     resolve, reject = resolvers
 
     async def run():
-        on_abort = None
-        with trio.CancelScope() as scope:
-            if signal is not None:
-                if signal.aborted:
-                    scope.cancel()
-                else:
-                    on_abort = ffi.create_proxy(lambda _event: scope.cancel())
-                    signal.addEventListener("abort", on_abort)
-            try:
-                result = await awaitable
-            except trio.Cancelled:
-                if signal is not None and signal.aborted:
-                    reject(signal.reason)
-                else:
-                    reject(_make_error(CANCELLED_ERROR_NAME, "the Trio task was cancelled", None))
+        try:
+            result = await awaitable
+        except trio.Cancelled:
+            reject(_make_error(CANCELLED_ERROR_NAME, "the Trio task was cancelled", None))
+            raise
+        except BaseException as exc:
+            reject(_error_from_exception(exc))
+            if not isinstance(exc, Exception):
                 raise
-            except BaseException as exc:
-                reject(
-                    _make_error(
-                        type(exc).__name__,
-                        str(exc),
-                        "".join(traceback.format_exception(exc)),
-                    )
-                )
-                if not isinstance(exc, Exception):
-                    raise
-                return
-            finally:
-                if on_abort is not None:
-                    signal.removeEventListener("abort", on_abort)
-                    on_abort.destroy()
-            resolve(ffi.to_js(result))
+            return
+        resolve(ffi.to_js(result))
 
     try:
         trio.lowlevel.spawn_system_task(run)
     except RuntimeError as exc:  # no Trio run is active, or it has finished
-        reject(_make_error(type(exc).__name__, str(exc), None))
+        reject(_error_from_exception(exc))
     return promise
+
+
+def _error_from_exception(exc):
+    if isinstance(exc, ffi.JsException):
+        return exc.js_error  # e.g. an abort reason raised by cancel_on_abort
+    return _make_error(
+        type(exc).__name__, str(exc), "".join(traceback.format_exception(exc))
+    )
 
 
 def _trio_is_running():
@@ -302,19 +289,22 @@ def trio_py_to_js(pyawaitable):
         # Nothing to do with Trio: let the previous hook (asyncio) run it.
         return _previous.py_to_js(pyawaitable)
     return _promise_for(pyawaitable)
-
-
-def callable_from_js(async_fn):
-    """Still useful: it is the only way for JavaScript to pass an AbortSignal."""
-    return lambda *args, signal=None: _promise_for(async_fn(*args), signal)
 ```
 
 `_promise_for` is today's `callable_from_js` body: make the promise with
 `Promise.new`, start a system task that awaits the awaitable, resolve with
 `to_js(result)`, reject with an `Error` carrying the Python traceback as
-`stack`, map an `AbortSignal` onto a cancel scope, and reject with
-`"TrioCancelled"` when Trio cancels it. Exceptions go to the JavaScript
-caller only.
+`stack`, or with the JavaScript error itself when the exception is a
+`JsException`, and reject with `"TrioCancelled"` when Trio cancels it.
+Exceptions go to the JavaScript caller only.
+
+Cancellation from JavaScript needs nothing here. The caller passes an
+`AbortSignal` as an ordinary argument, and the Trio function turns it into
+a cancel scope with `cancel_on_abort(signal)`, the converse of
+`abort_signal()`. When that scope ends because of the abort, it raises the
+abort reason, which reaches the JavaScript caller as the rejection, the
+way an aborted `fetch` rejects. So `callable_from_js` disappears entirely
+with the hooks.
 
 The task is a system task rather than a child of some nursery, because no
 nursery is the right owner. Either the JavaScript was itself called from a
@@ -340,8 +330,9 @@ Once, at `import trio.pyodide`, chaining to whatever was there, because the
 dispatch above already keeps asyncio working. (Installing and restoring per
 run, the way Trio handles `sys.set_asyncgen_hooks`, would work too.)
 
-With the hooks in place, `wait_promise`, `call_method` and the JavaScript
-call helper all disappear from `trio.pyodide`, and `fetch` becomes
+With the hooks in place, `wait_promise`, `call_method`, `callable_from_js`
+and the JavaScript call helper all disappear from `trio.pyodide`, and
+`fetch` becomes
 
 ```python
 with abort_signal() as signal:
@@ -351,8 +342,6 @@ with abort_signal() as signal:
 
 ## Open questions
 
-- There is no way for JavaScript to pass an `AbortSignal` through a plain
-  `await` of a Python coroutine, so `callable_from_js` would stay for that.
 - Flavour detection is coarse: an active Trio run claims every coroutine
   JavaScript awaits. A sniffio-style "current async library" query would
   let the hook defer to the right framework among several, rather than

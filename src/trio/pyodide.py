@@ -19,6 +19,7 @@ from ._pyodide import (
     call as call,
     call_method as call_method,
     callable_from_js as callable_from_js,
+    cancel_on_abort as cancel_on_abort,
     fetch as fetch,
     wait_promise as wait_promise,
 )

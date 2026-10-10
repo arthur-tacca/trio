@@ -169,7 +169,11 @@ async def trio_main() -> dict[str, object]:
     ), description
     results["callable_from_js: exception"] = description
 
-    start_forever = trio.pyodide.callable_from_js(trio.sleep_forever)
+    async def sleep_until_aborted(signal: object = None) -> None:
+        with trio.pyodide.cancel_on_abort(signal):
+            await trio.sleep_forever()
+
+    start_forever = trio.pyodide.callable_from_js(sleep_until_aborted)
     promise = run_js(
         """(start) => {
             const controller = new AbortController();

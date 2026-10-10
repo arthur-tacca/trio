@@ -26,7 +26,7 @@ from typing import Final, NamedTuple
 import js
 from outcome import Value
 from pyodide.code import run_js
-from pyodide.ffi import create_proxy, to_js
+from pyodide.ffi import JsException, create_proxy, to_js
 
 import trio
 
@@ -332,6 +332,10 @@ _make_error = run_js(
 
 
 def _error_from_exception(exc: BaseException) -> object:
+    if isinstance(exc, JsException):
+        # A JavaScript error that passed through Python, such as an abort
+        # reason raised by cancel_on_abort: hand JavaScript the original
+        return exc.js_error
     return _make_error(
         type(exc).__name__,
         str(exc),
@@ -339,24 +343,74 @@ def _error_from_exception(exc: BaseException) -> object:
     )
 
 
+# Raises a JavaScript value in Python, as a JsException wrapping it
+_throw = run_js("(reason) => { throw reason; }")
+
+
+@contextmanager
+def cancel_on_abort(signal: object) -> Iterator[trio.CancelScope]:
+    """Cancel the block when a JavaScript ``AbortSignal`` is aborted.
+
+    This is the converse of `abort_signal`: a cancel scope that a signal
+    JavaScript controls cancels. Use it in a Trio function that JavaScript
+    calls (see `callable_from_js`), to let the caller cancel it::
+
+        async def fetch_user(user_id, signal=None):
+            with trio.pyodide.cancel_on_abort(signal):
+                ...
+
+    Aborting the signal cancels the scope, which raises `~trio.Cancelled`
+    at the block's next checkpoint, as any cancel scope does; a signal that
+    is already aborted cancels it straight away. When the block ends because
+    of that cancellation, the signal's abort reason (the JavaScript error it
+    was aborted with) is raised, as a `pyodide.ffi.JsException`, so that a
+    function called from JavaScript rejects its promise with the reason, the
+    way an aborted ``fetch`` does. Catch it if you want something else to
+    happen. ``signal`` may be ``None``, for callers that didn't pass one, in
+    which case the block is an ordinary cancel scope.
+
+    The context manager yields the `~trio.CancelScope`, so you can also give
+    it a deadline, or cancel it yourself.
+
+    """
+    on_abort = None
+    with trio.CancelScope() as scope:
+        if signal is not None:
+            if signal.aborted:
+                scope.cancel()
+            else:
+                on_abort = create_proxy(lambda _event: scope.cancel())
+                signal.addEventListener("abort", on_abort)
+        try:
+            yield scope
+        finally:
+            if on_abort is not None:
+                signal.removeEventListener("abort", on_abort)
+                on_abort.destroy()
+    if scope.cancelled_caught and signal is not None and signal.aborted:
+        _throw(signal.reason)
+
+
 def callable_from_js(
     async_fn: Callable[..., Awaitable[object]],
 ) -> Callable[..., object]:
     """Return a function that JavaScript can call to run ``async_fn``.
 
-    Each call starts ``async_fn(*args)`` as a Trio system task and
+    Each call starts ``async_fn(*args, **kwargs)`` as a Trio system task and
     immediately returns a JavaScript ``Promise``, which is fulfilled with the
     task's return value (converted with `pyodide.ffi.to_js`) or rejected if
     it raises. Exceptions are delivered to the JavaScript caller only: a
     rejection is a JavaScript ``Error`` whose ``name`` is the Python
-    exception type's name, and whose ``stack`` is the Python traceback.
+    exception type's name, and whose ``stack`` is the Python traceback, or,
+    for a `pyodide.ffi.JsException`, the JavaScript error it wraps.
+    (JavaScript passes keyword arguments with ``callKwargs``.)
 
-    JavaScript can pass an ``AbortSignal`` as the ``signal`` keyword argument
-    (with ``callKwargs``, since it's a keyword argument). Aborting it cancels
-    the task, and the promise is rejected with the signal's reason.
+    To let JavaScript cancel the call, have ``async_fn`` take an
+    ``AbortSignal`` as an argument and use `cancel_on_abort` with it; the
+    promise is then rejected with the signal's abort reason.
 
     The task belongs to no nursery of yours: JavaScript chose to make the
-    call, so JavaScript owns its lifetime, through that signal. The only
+    call, so JavaScript owns its lifetime, through such a signal. The only
     other thing that cancels it is the end of the Trio run, which cancels
     every system task; the promise is then rejected with an ``Error`` named
     ``"TrioCancelled"``. A call made while no Trio run is active is rejected
@@ -368,7 +422,7 @@ def callable_from_js(
     ...``), or wrap it with `pyodide.ffi.create_proxy`.
     """
 
-    def start(*args: object, signal: object = None) -> object:
+    def start(*args: object, **kwargs: object) -> object:
         resolvers: list[object] = []
         promise = js.Promise.new(
             lambda resolve, reject: resolvers.extend((resolve, reject))
@@ -376,34 +430,17 @@ def callable_from_js(
         resolve, reject = resolvers
 
         async def run() -> None:
-            on_abort = None
-            with trio.CancelScope() as cancel_scope:
-                if signal is not None:
-                    if signal.aborted:
-                        cancel_scope.cancel()
-                    else:
-                        on_abort = create_proxy(lambda _event: cancel_scope.cancel())
-                        signal.addEventListener("abort", on_abort)
-                try:
-                    result = await async_fn(*args)
-                except trio.Cancelled:
-                    if signal is not None and signal.aborted:
-                        reject(signal.reason)
-                    else:
-                        reject(
-                            _make_error(CANCELLED_ERROR_NAME, _CANCELLED_MESSAGE, None)
-                        )
+            try:
+                result = await async_fn(*args, **kwargs)
+            except trio.Cancelled:
+                reject(_make_error(CANCELLED_ERROR_NAME, _CANCELLED_MESSAGE, None))
+                raise
+            except BaseException as exc:
+                reject(_error_from_exception(exc))
+                if not isinstance(exc, Exception):
                     raise
-                except BaseException as exc:
-                    reject(_error_from_exception(exc))
-                    if not isinstance(exc, Exception):
-                        raise
-                    return
-                finally:
-                    if on_abort is not None:
-                        signal.removeEventListener("abort", on_abort)
-                        on_abort.destroy()
-                resolve(to_js(result))
+                return
+            resolve(to_js(result))
 
         try:
             trio.lowlevel.spawn_system_task(run, name=async_fn)

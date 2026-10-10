@@ -1152,8 +1152,12 @@ block.
 
 In the other direction, ``trio.pyodide.callable_from_js(async_fn)``
 returns a function that JavaScript can call. Each call starts
-``async_fn(*args)`` as a system task, and immediately returns a
-JavaScript ``Promise`` for its result::
+``async_fn(*args, **kwargs)`` as a system task, and immediately returns
+a JavaScript ``Promise`` for its result::
+
+   async def fetch_user(user_id, signal=None):
+       with trio.pyodide.cancel_on_abort(signal):
+           ...
 
    js.myApp.fetchUser = trio.pyodide.callable_from_js(fetch_user)
 
@@ -1164,17 +1168,22 @@ JavaScript ``Promise`` for its result::
 
 The return value is converted with `pyodide.ffi.to_js`. If the task
 raises, the promise is rejected with an ``Error`` whose ``name`` is the
-exception type's name and whose ``stack`` is the Python traceback; the
-exception goes to the JavaScript caller only. JavaScript can pass an
-``AbortSignal`` as the ``signal`` keyword argument; aborting it cancels
-the task, and the promise is rejected with the signal's reason. The
-task belongs to no nursery: JavaScript made the call, so JavaScript
-owns its lifetime, through that signal. The only other thing that
-cancels it is the end of the Trio run, which rejects the promise with
-an ``Error`` named ``"TrioCancelled"``. A call made while no Trio run
-is active is rejected with a ``RuntimeError``. (Pyodide's own way of
-awaiting a Python coroutine from JavaScript runs it on asyncio, so it
-can't be used with Trio.)
+exception type's name and whose ``stack`` is the Python traceback, or,
+for a `pyodide.ffi.JsException`, with the JavaScript error it wraps;
+the exception goes to the JavaScript caller only.
+``trio.pyodide.cancel_on_abort(signal)`` is the converse of
+``abort_signal``: a cancel scope that an ``AbortSignal`` cancels. When
+the block ends because the signal was aborted, the signal's abort
+reason is raised, so a function called from JavaScript rejects its
+promise with the reason, the way an aborted ``fetch`` does; catch it if
+you want something else to happen. It accepts ``None``, for callers
+that passed no signal. The task belongs to no nursery: JavaScript made
+the call, so JavaScript owns its lifetime, through such a signal. The
+only other thing that cancels it is the end of the Trio run, which
+rejects the promise with an ``Error`` named ``"TrioCancelled"``. A call
+made while no Trio run is active is rejected with a ``RuntimeError``.
+(Pyodide's own way of awaiting a Python coroutine from JavaScript runs
+it on asyncio, so it can't be used with Trio.)
 
 ``await trio.pyodide.fetch(url, *, method="GET", headers=None,
 body=None, **options)`` makes an HTTP request with the browser's

@@ -30,6 +30,11 @@ class FakeJsError(Exception):
         self.name = name
         self.stack = stack
 
+    @property
+    def js_error(self) -> FakeJsError:
+        # pyodide.ffi.JsException.js_error: the JavaScript error itself
+        return self
+
     @classmethod
     def new(cls, message: str) -> FakeJsError:
         return cls(message)
@@ -181,6 +186,13 @@ def fake_run_js(source: str) -> Callable[..., object]:  # type: ignore[explicit-
             return call_in_js
 
         return make_call_in_js
+    if "throw reason" in source:
+
+        def throw(reason: object) -> None:
+            assert isinstance(reason, BaseException)
+            raise reason
+
+        return throw
     raise NotImplementedError(source)  # pragma: no cover
 
 
@@ -200,6 +212,7 @@ def trio_pyodide() -> Iterator[ModuleType]:
     fake_pyodide = types.ModuleType("pyodide")
     fake_ffi = types.ModuleType("pyodide.ffi")
     fake_ffi.create_proxy = FakeProxy  # type: ignore[attr-defined]
+    fake_ffi.JsException = FakeJsError  # type: ignore[attr-defined]
     fake_ffi.to_js = lambda obj, **kwargs: obj  # type: ignore[attr-defined]
     fake_code = types.ModuleType("pyodide.code")
     fake_code.run_js = fake_run_js  # type: ignore[attr-defined]
@@ -506,6 +519,17 @@ async def test_callable_from_js_result(trio_pyodide: ModuleType) -> None:
     assert sorted(record, key=repr) == [("fulfilled", 42), ("fulfilled", 8)]
 
 
+async def test_callable_from_js_keyword_arguments(trio_pyodide: ModuleType) -> None:
+    async def greet(name: str, *, greeting: str = "hi") -> str:
+        await trio.lowlevel.checkpoint()
+        return f"{greeting} {name}"
+
+    record: list[tuple[str, object]] = []
+    js_awaits(trio_pyodide.callable_from_js(greet)("bob", greeting="hello"), record)
+    await trio.testing.wait_all_tasks_blocked()
+    assert record == [("fulfilled", "hello bob")]
+
+
 async def test_callable_from_js_exception(trio_pyodide: ModuleType) -> None:
     async def boom() -> None:
         await trio.lowlevel.checkpoint()
@@ -524,11 +548,35 @@ async def test_callable_from_js_exception(trio_pyodide: ModuleType) -> None:
     assert 'raise ValueError("boom")' in error.stack
 
 
+async def test_callable_from_js_js_error_passes_through(
+    trio_pyodide: ModuleType,
+) -> None:
+    # A JavaScript error raised in Python goes back to JavaScript as itself
+    error = FakeJsError("nope", "RangeError")
+
+    async def boom() -> None:
+        await trio.lowlevel.checkpoint()
+        raise error
+
+    record: list[tuple[str, object]] = []
+    js_awaits(trio_pyodide.callable_from_js(boom)(), record)
+    await trio.testing.wait_all_tasks_blocked()
+    assert record == [("rejected", error)]
+
+
+async def sleep_until_aborted(
+    trio_pyodide: ModuleType,
+    signal: object = None,
+) -> None:
+    with trio_pyodide.cancel_on_abort(signal):
+        await trio.sleep_forever()
+
+
 async def test_callable_from_js_abort_from_js(trio_pyodide: ModuleType) -> None:
     controller = FakeAbortController()
     record: list[tuple[str, object]] = []
-    start = trio_pyodide.callable_from_js(trio.sleep_forever)
-    js_awaits(start(signal=controller.signal), record)
+    start = trio_pyodide.callable_from_js(sleep_until_aborted)
+    js_awaits(start(trio_pyodide, signal=controller.signal), record)
     await trio.testing.wait_all_tasks_blocked()
     assert record == []
     assert len(controller.signal.listeners) == 1
@@ -543,8 +591,8 @@ async def test_callable_from_js_already_aborted(trio_pyodide: ModuleType) -> Non
     controller = FakeAbortController()
     controller.abort()
     record: list[tuple[str, object]] = []
-    start = trio_pyodide.callable_from_js(trio.sleep_forever)
-    js_awaits(start(signal=controller.signal), record)
+    start = trio_pyodide.callable_from_js(sleep_until_aborted)
+    js_awaits(start(trio_pyodide, signal=controller.signal), record)
     await trio.testing.wait_all_tasks_blocked()
     assert record == [("rejected", controller.signal.reason)]
 
@@ -556,9 +604,9 @@ def test_callable_from_js_cancelled_when_the_run_ends(
     promises: list[object] = []
 
     async def main() -> None:
-        start = trio_pyodide.callable_from_js(trio.sleep_forever)
-        promises.append(start(signal=controller.signal))
-        promises.append(start())
+        start = trio_pyodide.callable_from_js(sleep_until_aborted)
+        promises.append(start(trio_pyodide, signal=controller.signal))
+        promises.append(start(trio_pyodide))
         await trio.testing.wait_all_tasks_blocked()
         # Returning ends the run, which cancels the system tasks on its way out
 
@@ -583,3 +631,61 @@ def test_callable_from_js_without_a_run(trio_pyodide: ModuleType) -> None:
     assert kind == "rejected"
     assert isinstance(error, FakeJsError)
     assert error.name == "RuntimeError"
+
+
+################################################################
+# cancel_on_abort
+################################################################
+
+
+async def test_cancel_on_abort(
+    trio_pyodide: ModuleType,
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    controller = FakeAbortController()
+    record: list[object] = []
+
+    async def worker() -> None:
+        with trio_pyodide.cancel_on_abort(controller.signal) as scope:
+            await trio.sleep_forever()
+        record.append(scope.cancelled_caught)  # not reached: the reason is raised
+
+    with pytest.RaisesGroup(
+        pytest.RaisesExc(check=lambda exc: exc is controller.signal.reason)
+    ):
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(worker)
+            await trio.sleep(1)
+            assert len(controller.signal.listeners) == 1
+            controller.abort()
+    assert record == []
+    assert controller.signal.listeners == []
+
+
+async def test_cancel_on_abort_already_aborted(trio_pyodide: ModuleType) -> None:
+    controller = FakeAbortController()
+    controller.abort()
+    with pytest.raises(FakeJsError) as excinfo:
+        with trio_pyodide.cancel_on_abort(controller.signal):
+            await trio.sleep_forever()
+    assert excinfo.value is controller.signal.reason
+
+
+async def test_cancel_on_abort_without_signal(trio_pyodide: ModuleType) -> None:
+    with trio_pyodide.cancel_on_abort(None) as scope:
+        await trio.lowlevel.checkpoint()
+    assert not scope.cancelled_caught
+
+
+async def test_cancel_on_abort_own_deadline(
+    trio_pyodide: ModuleType,
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    # A cancellation that isn't the abort is just a cancellation
+    controller = FakeAbortController()
+    with trio_pyodide.cancel_on_abort(controller.signal) as scope:
+        scope.deadline = trio.current_time() + 1
+        await trio.sleep_forever()
+    assert scope.cancelled_caught
+    assert not controller.signal.aborted
+    assert controller.signal.listeners == []
