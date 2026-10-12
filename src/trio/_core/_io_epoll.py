@@ -9,11 +9,15 @@ from typing import TYPE_CHECKING, Literal, TypeAlias
 import attrs
 
 from .. import _core
-from ._io_common import wake_all
+from ._io_common import wait_for_events_in_thread, wake_all
 from ._run import Task, _public
 from ._wakeup_socketpair import WakeupSocketpair
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from outcome import Outcome
+
     from .._core import Abort, RaiseCancelT
     from .._file_io import _HasFileNo
 
@@ -228,6 +232,22 @@ class EpollIOManager:
     def close(self) -> None:
         self._epoll.close()
         self._force_wakeup.close()
+
+    def wait_for_events(
+        self,
+        timeout: float,
+        deliver: Callable[[Outcome[EventResult]], None],
+        *,
+        run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
+        run_sync_later: (
+            Callable[[Callable[[], object], float], Callable[[], object]] | None
+        ),
+    ) -> None:
+        # Guest mode. run_sync_later is only for I/O managers that can't
+        # block (Emscripten); this one waits on a worker thread.
+        wait_for_events_in_thread(
+            self.get_events, timeout, deliver, run_sync_soon_threadsafe
+        )
 
     def force_wakeup(self) -> None:
         self._force_wakeup.wakeup_thread_and_signal_safe()

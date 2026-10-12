@@ -11,7 +11,7 @@ import attrs
 from outcome import Value
 
 from .. import _core
-from ._io_common import wake_all
+from ._io_common import wait_for_events_in_thread, wake_all
 from ._run import _public
 from ._windows_cffi import (
     INVALID_HANDLE_VALUE,
@@ -36,6 +36,7 @@ from ._windows_cffi import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from outcome import Outcome
     from typing_extensions import Buffer
 
     from .._file_io import _HasFileNo
@@ -517,6 +518,22 @@ class WindowsIOManager:
             tasks_waiting_write=tasks_waiting_write,
             tasks_waiting_overlapped=len(self._overlapped_waiters),
             completion_key_monitors=len(self._completion_key_queues),
+        )
+
+    def wait_for_events(
+        self,
+        timeout: float,
+        deliver: Callable[[Outcome[EventResult]], None],
+        *,
+        run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
+        run_sync_later: (
+            Callable[[Callable[[], object], float], Callable[[], object]] | None
+        ),
+    ) -> None:
+        # Guest mode. run_sync_later is only for I/O managers that can't
+        # block (Emscripten); this one waits on a worker thread.
+        wait_for_events_in_thread(
+            self.get_events, timeout, deliver, run_sync_soon_threadsafe
         )
 
     def force_wakeup(self) -> None:

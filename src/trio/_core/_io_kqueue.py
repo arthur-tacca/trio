@@ -10,6 +10,7 @@ import attrs
 import outcome
 
 from .. import _core
+from ._io_common import wait_for_events_in_thread
 from ._run import _public
 from ._wakeup_socketpair import WakeupSocketpair
 
@@ -63,6 +64,22 @@ class KqueueIOManager:
     def close(self) -> None:
         self._kqueue.close()
         self._force_wakeup.close()
+
+    def wait_for_events(
+        self,
+        timeout: float,
+        deliver: Callable[[outcome.Outcome[EventResult]], None],
+        *,
+        run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
+        run_sync_later: (
+            Callable[[Callable[[], object], float], Callable[[], object]] | None
+        ),
+    ) -> None:
+        # Guest mode. run_sync_later is only for I/O managers that can't
+        # block (Emscripten); this one waits on a worker thread.
+        wait_for_events_in_thread(
+            self.get_events, timeout, deliver, run_sync_soon_threadsafe
+        )
 
     def force_wakeup(self) -> None:
         self._force_wakeup.wakeup_thread_and_signal_safe()

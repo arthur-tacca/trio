@@ -47,7 +47,6 @@ from ._instrumentation import Instruments
 from ._ki import KIManager, enable_ki_protection
 from ._parking_lot import GLOBAL_PARKING_LOT_BREAKER
 from ._run_context import GLOBAL_RUN_CONTEXT as GLOBAL_RUN_CONTEXT
-from ._thread_cache import start_thread_soon
 from ._traps import (
     Abort,
     CancelShieldedCheckpoint,
@@ -1740,12 +1739,11 @@ class GuestState:  # type: ignore[explicit-any]
     unrolled_run_gen: Generator[float, EventResult, None]
     unrolled_run_next_send: Outcome[Any] = attrs.Factory(lambda: Value(None))  # type: ignore[explicit-any]
     # Emscripten only: asks the host loop to call a function after a delay,
-    # and returns a function that cancels that. See start_guest_run.
+    # and returns a function that cancels that. It's handed to the I/O
+    # manager, which waits for timeouts with it. See start_guest_run.
     run_sync_later: (
         Callable[[Callable[[], object], float], Callable[[], object]] | None
     ) = None
-    host_timer_cancel: Callable[[], object] | None = None
-    host_timer_token: object | None = None
 
     def guest_tick(self) -> None:
         prev_library, sniffio_library.name = sniffio_library.name, "trio"
@@ -1771,60 +1769,26 @@ class GuestState:  # type: ignore[explicit-any]
             self.unrolled_run_next_send = events_outcome
             self.runner.guest_tick_scheduled = True
             self.run_sync_soon_not_threadsafe(self.guest_tick)
-        elif self.run_sync_later is not None:
-            # Emscripten: there are no worker threads, but there's also
-            # nothing to wait for except the timeout, so we ask the host loop
-            # to call us back when it expires. If the host does something
-            # that needs Trio's attention before then (rescheduling a task,
-            # changing a deadline, calling run_sync_soon), that goes through
-            # Runner.force_guest_tick_asap -> EmscriptenIOManager.force_wakeup
-            # -> self.wake_up_from_host, which cancels the timer and schedules
-            # a tick right away instead.
-            self.runner.guest_tick_scheduled = False
-            token = object()
-
-            def host_timer_expired() -> None:
-                if self.host_timer_token is not token:  # pragma: no cover
-                    # This timer was cancelled. A well-behaved host shouldn't
-                    # call us, but it doesn't hurt to be defensive.
-                    return
-                self.host_timer_token = self.host_timer_cancel = None
-                self.unrolled_run_next_send = capture(
-                    self.runner.io_manager.get_events,
-                    0,
-                )
-                self.runner.guest_tick_scheduled = True
-                self.guest_tick()
-
-            self.host_timer_token = token
-            self.host_timer_cancel = self.run_sync_later(host_timer_expired, timeout)
         else:
-            # Need to go into the thread and call get_events() there
+            # Wait for I/O, the timeout, or a force_wakeup(), without blocking
+            # this thread. How is up to the I/O manager: the ones that can
+            # block in get_events() do so on a worker thread, and the
+            # Emscripten one asks the host loop for a timer instead. Either
+            # way, deliver_events() is called on the main thread once the
+            # wait is over.
             self.runner.guest_tick_scheduled = False
+            self.runner.io_manager.wait_for_events(
+                timeout,
+                self.deliver_events,
+                run_sync_soon_threadsafe=self.run_sync_soon_threadsafe,
+                run_sync_later=self.run_sync_later,
+            )
 
-            def get_events() -> EventResult:
-                return self.runner.io_manager.get_events(timeout)
-
-            def deliver(events_outcome: Outcome[EventResult]) -> None:
-                def in_main_thread() -> None:
-                    self.unrolled_run_next_send = events_outcome
-                    self.runner.guest_tick_scheduled = True
-                    self.guest_tick()
-
-                self.run_sync_soon_threadsafe(in_main_thread)
-
-            start_thread_soon(get_events, deliver)
-
-    def wake_up_from_host(self) -> None:
-        # Emscripten only. Called (via EmscriptenIOManager.force_wakeup) from
-        # Runner.force_guest_tick_asap, when host code did something that
-        # needs a guest tick while we were waiting on a host timer.
-        self.host_timer_token = None
-        cancel, self.host_timer_cancel = self.host_timer_cancel, None
-        if cancel is not None:
-            cancel()
-        self.unrolled_run_next_send = capture(self.runner.io_manager.get_events, 0)
-        self.run_sync_soon_not_threadsafe(self.guest_tick)
+    def deliver_events(self, events_outcome: Outcome[EventResult]) -> None:
+        # The I/O manager's wait is over: run the next tick
+        self.unrolled_run_next_send = events_outcome
+        self.runner.guest_tick_scheduled = True
+        self.guest_tick()
 
 
 @attrs.define(eq=False)
@@ -2734,9 +2698,6 @@ def start_guest_run(  # type: ignore[explicit-any]
         ),
         run_sync_later=run_sync_later,
     )
-    if sys.platform == "emscripten":
-        runner.io_manager.set_guest_wakeup(guest_state.wake_up_from_host)
-
     # Run a few ticks of the guest run synchronously, so that by the
     # time we return, the system nursery exists and callers can use
     # spawn_system_task. We don't actually run any user code during

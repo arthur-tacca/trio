@@ -426,15 +426,40 @@ def test_emscripten_run_sync_later_validation(
 @restore_unraisablehook()
 @pytest.mark.usefixtures("emscripten_mode")
 def test_emscripten_guest_warns_if_abandoned() -> None:
-    # Like test_guest_warns_if_abandoned in test_guest_mode.py. This also
-    # checks that the IO manager's reference back to the GuestState is weak:
-    # if the Runner kept the GuestState alive, the run would never be garbage
-    # collected, and so never cleaned up.
+    # Like test_guest_warns_if_abandoned in test_guest_mode.py. Here the run
+    # is abandoned between ticks, with the next tick queued on the host loop.
     def do_abandoned_guest_run() -> None:
         async def abandoned_main(in_host: InHost) -> None:
             in_host(lambda: 1 / 0)
             while True:
                 await trio.lowlevel.checkpoint()
+
+        with pytest.raises(ZeroDivisionError):
+            emscripten_guest_run(abandoned_main)
+
+    with pytest.warns(  # noqa: PT031
+        RuntimeWarning,
+        match="Trio guest run got abandoned",
+    ):
+        do_abandoned_guest_run()
+        gc_collect_harder()
+
+    with pytest.raises(RuntimeError):
+        trio.current_time()
+
+
+@restore_unraisablehook()
+@pytest.mark.usefixtures("emscripten_mode")
+def test_emscripten_guest_warns_if_abandoned_during_wait() -> None:
+    # Like the above, but here the run is abandoned while Trio is waiting on a
+    # host timer. That's when the I/O manager knows about the GuestState (it
+    # has to, so that force_wakeup() can cut the wait short), and it must
+    # only refer to it weakly: if the Runner kept the GuestState alive, the
+    # run would never be garbage collected, and so never cleaned up.
+    def do_abandoned_guest_run() -> None:
+        async def abandoned_main(in_host: InHost) -> None:
+            in_host(lambda: 1 / 0)
+            await trio.sleep(10)
 
         with pytest.raises(ZeroDivisionError):
             emscripten_guest_run(abandoned_main)
