@@ -1288,21 +1288,9 @@ class Nursery(metaclass=NoPublicConstructor):
         self._check_nursery_closed()
 
         if not self._closed:
-            # If we have a KeyboardInterrupt injected, we want to save it in
-            # the nursery's final exceptions list. But if it's just a
-            # Cancelled, then we don't -- see gh-1457.
-            def aborted(raise_cancel: _core.RaiseCancelT) -> Abort:
-                exn = capture(raise_cancel).error
-                if not isinstance(exn, Cancelled):
-                    self._add_exc(
-                        exn,
-                        CancelReason(
-                            source="KeyboardInterrupt",
-                            source_task=repr(self._parent_task),
-                        ),
-                    )
-                # see test_cancel_scope_exit_doesnt_create_cyclic_garbage
-                del exn  # prevent cyclic garbage creation
+            # Being cancelled while we wait for our children changes nothing:
+            # they're being cancelled too, and we still have to wait for them.
+            def aborted(_: _core.RaiseCancelT) -> Abort:
                 return Abort.FAILED
 
             self._parent_waiting_in_aexit = True
@@ -1664,17 +1652,6 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
 
         self._attempt_abort(raise_cancel)
 
-    def _attempt_delivery_of_pending_ki(self) -> None:
-        assert self._runner.ki_pending
-        if self._abort_func is None:
-            return
-
-        def raise_cancel() -> NoReturn:
-            self._runner.ki_pending = False
-            raise KeyboardInterrupt
-
-        self._attempt_abort(raise_cancel)
-
 
 ################################################################
 # The central Runner object
@@ -1805,6 +1782,9 @@ class Runner:  # type: ignore[explicit-any]
     system_context: contextvars.Context = attrs.field(kw_only=True)
     main_task: Task | None = None
     main_task_outcome: Outcome[object] | None = None
+    # The cancel scope that init() wraps around the main task; a deferred
+    # control-C is delivered by cancelling it.
+    main_task_scope: CancelScope | None = None
 
     entry_queue: EntryQueue = attrs.Factory(EntryQueue)
     trio_token: TrioToken | None = None
@@ -2154,25 +2134,27 @@ class Runner:  # type: ignore[explicit-any]
         async with open_nursery() as run_sync_soon_nursery:
             # All other system tasks run here:
             async with open_nursery() as self.system_nursery:
-                # Only the main task runs here:
-                async with open_nursery() as main_task_nursery:
-                    try:
-                        self.main_task = self.spawn_impl(
-                            async_fn,
-                            args,
-                            main_task_nursery,
-                            None,
+                # Only the main task runs here. The cancel scope is how a
+                # deferred control-C reaches it: see deliver_ki().
+                with CancelScope() as self.main_task_scope:
+                    async with open_nursery() as main_task_nursery:
+                        try:
+                            self.main_task = self.spawn_impl(
+                                async_fn,
+                                args,
+                                main_task_nursery,
+                                None,
+                            )
+                        except BaseException as exc:
+                            self.main_task_outcome = Error(exc)
+                            return
+                        self.spawn_impl(
+                            self.entry_queue.task,
+                            (),
+                            run_sync_soon_nursery,
+                            "<TrioToken.run_sync_soon task>",
+                            system_task=True,
                         )
-                    except BaseException as exc:
-                        self.main_task_outcome = Error(exc)
-                        return
-                    self.spawn_impl(
-                        self.entry_queue.task,
-                        (),
-                        run_sync_soon_nursery,
-                        "<TrioToken.run_sync_soon task>",
-                        system_task=True,
-                    )
 
                 # Main task is done; start shutting down system tasks
                 self.system_nursery.cancel_scope._cancel(
@@ -2225,22 +2207,30 @@ class Runner:  # type: ignore[explicit-any]
 
     # This gets called from signal context
     def deliver_ki(self) -> None:
-        self.ki_pending = True
-        with suppress(RunFinishedError):
-            self.entry_queue.run_sync_soon(self._deliver_ki_cb)
+        """Called from the SIGINT handler when it's not safe to raise
+        KeyboardInterrupt where the signal landed.
 
-    def _deliver_ki_cb(self) -> None:
-        if not self.ki_pending:
+        The main task will be cancelled, and run() will raise
+        KeyboardInterrupt once everything has shut down. A second control-C
+        while that's in progress has nothing to add, so it's absorbed.
+        """
+        if self.ki_pending:
             return
-        # Can't happen because main_task and run_sync_soon_task are created at
-        # the same time -- so even if KI arrives before main_task is created,
-        # we won't get here until afterwards.
-        assert self.main_task is not None
-        if self.main_task_outcome is not None:
-            # We're already in the process of exiting -- leave ki_pending set
-            # and we'll check it again on our way out of run().
+        self.ki_pending = True
+        # Make sure the run loop wakes up and gets to a safe point soon; the
+        # actual cancellation happens there, not in the signal handler.
+        with suppress(RunFinishedError):
+            self.entry_queue.run_sync_soon(self._cancel_main_task_for_ki)
+
+    def _cancel_main_task_for_ki(self) -> None:
+        scope = self.main_task_scope
+        if scope is None or scope.cancel_called or self.main_task_outcome is not None:
+            # Either the main task doesn't exist yet (the run loop will try
+            # again), we've already done this, or the main task has already
+            # finished and we'll raise KeyboardInterrupt on the way out of
+            # run().
             return
-        self.main_task._attempt_delivery_of_pending_ki()
+        scope._cancel(CancelReason(source="KeyboardInterrupt"))
 
     ################
     # Quiescing
@@ -2468,11 +2458,19 @@ def run(
           user hits control-C while :func:`run` is running? If this argument
           is False (the default), then you get the standard Python behavior: a
           :exc:`KeyboardInterrupt` exception will immediately interrupt
-          whatever task is running (or if no task is running, then Trio will
-          wake up a task to be interrupted). Alternatively, if you set this
-          argument to True, then :exc:`KeyboardInterrupt` delivery will be
-          delayed: it will be *only* be raised at :ref:`checkpoints
-          <checkpoints>`, like a :exc:`Cancelled` exception.
+          whatever task is running. If no task is running, or the running
+          code is protected against :exc:`KeyboardInterrupt`, then Trio
+          instead cancels the main task, as if a cancel scope around it had
+          been cancelled, and raises :exc:`KeyboardInterrupt` from
+          :func:`run` once everything has shut down. Alternatively, if you
+          set this argument to True, then control-C always takes that second
+          route, so it only ever interrupts your code at :ref:`checkpoints
+          <checkpoints>`, as a :exc:`Cancelled` exception.
+
+          Either way, a second control-C while the first is still being
+          handled is absorbed, except that with the default setting it still
+          raises :exc:`KeyboardInterrupt` immediately if it arrives while
+          unprotected code is running, like any other control-C.
 
           The default behavior is nice because it means that even if you
           accidentally write an infinite loop that never executes any
@@ -2811,6 +2809,11 @@ def unrolled_run(
                     assert isinstance(runner.clock, _core.MockClock)
                     runner.clock._autojump()
 
+            # A deferred control-C: cancel the main task (once it exists) here,
+            # at a safe point, rather than from inside the signal handler.
+            if runner.ki_pending:
+                runner._cancel_main_task_for_ki()
+
             # Process all runnable tasks, but only the ones that are already
             # runnable now. Anything that becomes runnable during this cycle
             # needs to wait until the next pass. This avoids various
@@ -2902,10 +2905,6 @@ def unrolled_run(
                     elif type(msg) is WaitTaskRescheduled:
                         task._cancel_points += 1
                         task._abort_func = msg.abort_func
-                        # KI is "outside" all cancel scopes, so check for it
-                        # before checking for regular cancellation:
-                        if runner.ki_pending and task is runner.main_task:
-                            task._attempt_delivery_of_pending_ki()
                         task._attempt_delivery_of_any_pending_cancel()
                     elif type(msg) is PermanentlyDetachCoroutineObject:
                         # Pretend the task just exited with the given outcome
@@ -2956,9 +2955,20 @@ def unrolled_run(
         # after we check it.
         if runner.ki_pending:
             ki = KeyboardInterrupt()
-            if isinstance(runner.main_task_outcome, Error):
+            if isinstance(runner.main_task_outcome, Error) and not _is_ki_cancellation(
+                runner.main_task_outcome.error
+            ):
                 ki.__context__ = runner.main_task_outcome.error
             runner.main_task_outcome = Error(ki)
+
+
+def _is_ki_cancellation(exc: BaseException) -> bool:
+    # Is this just the Cancelled (or group of them) that we raised in the main
+    # task on the user's behalf after a control-C? Chaining that onto the
+    # KeyboardInterrupt would only be noise.
+    if isinstance(exc, BaseExceptionGroup):
+        return all(_is_ki_cancellation(e) for e in exc.exceptions)
+    return isinstance(exc, Cancelled) and exc.source == "KeyboardInterrupt"
 
 
 ################################################################
@@ -3084,18 +3094,8 @@ async def checkpoint() -> None:
     await cancel_shielded_checkpoint()
     task = current_task()
     task._cancel_points += 1
-    if task._cancel_status.effectively_cancelled or (
-        task is task._runner.main_task and task._runner.ki_pending
-    ):
+    if task._cancel_status.effectively_cancelled:
         cs = CancelScope(deadline=-inf)
-        if (
-            task._cancel_status._scope._cancel_reason is None
-            and task is task._runner.main_task
-            and task._runner.ki_pending
-        ):
-            task._cancel_status._scope._cancel_reason = CancelReason(
-                source="KeyboardInterrupt"
-            )
         assert task._cancel_status._scope._cancel_reason is not None
         cs._cancel_reason = task._cancel_status._scope._cancel_reason
         with cs:
@@ -3118,9 +3118,7 @@ async def checkpoint_if_cancelled() -> None:
 
     """
     task = current_task()
-    if task._cancel_status.effectively_cancelled or (
-        task is task._runner.main_task and task._runner.ki_pending
-    ):
+    if task._cancel_status.effectively_cancelled:
         await _core.checkpoint()
         raise AssertionError("this should never happen")  # pragma: no cover
     task._cancel_points += 1

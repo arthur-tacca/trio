@@ -257,6 +257,9 @@ class KIManager:
             assert signum == signal.SIGINT
             protection_enabled = ki_protection_enabled(frame)
             if protection_enabled or restrict_keyboard_interrupt_to_checkpoints:
+                # Trio will cancel the main task, and raise KeyboardInterrupt
+                # from run() once everything has shut down. (If that's already
+                # under way, this is a second control-C, and it's absorbed.)
                 deliver_cb()
             else:
                 raise KeyboardInterrupt

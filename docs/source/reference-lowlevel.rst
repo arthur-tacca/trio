@@ -358,10 +358,12 @@ correctness invariants. On the other, if the user accidentally writes
 an infinite loop, we do want to be able to break out of that. Our
 solution is to install a default signal handler which checks whether
 it's safe to raise :exc:`KeyboardInterrupt` at the place where the
-signal is received. If so, then we do; otherwise, we schedule a
-:exc:`KeyboardInterrupt` to be delivered to the main task at the next
-available opportunity (similar to how :exc:`~trio.Cancelled` is
-delivered).
+signal is received. If so, then we do; otherwise, we cancel the main
+task (as if a cancel scope around it had been cancelled), and raise
+:exc:`KeyboardInterrupt` from :func:`trio.run` once everything has
+shut down. A second control-C while that's in progress raises
+:exc:`KeyboardInterrupt` immediately, wherever the program happens to
+be.
 
 So that's great, but – how do we know whether we're in one of the
 sensitive parts of the program or not?
@@ -409,9 +411,9 @@ These transitions are accomplished using two function decorators:
    against :exc:`KeyboardInterrupt`, i.e., the code inside this
    function *won't* be rudely interrupted by
    :exc:`KeyboardInterrupt`. (Though if it contains any
-   :ref:`checkpoints <checkpoints>`, then it can still receive
-   :exc:`KeyboardInterrupt` at those. This is considered a polite
-   interruption.)
+   :ref:`checkpoints <checkpoints>`, then a control-C can still cancel
+   it at those, as a :exc:`~trio.Cancelled`. This is considered a
+   polite interruption.)
 
    .. warning::
 

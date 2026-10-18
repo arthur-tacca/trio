@@ -16,7 +16,7 @@ import trio.lowlevel
 from trio._util import final
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
 
 class SuppressDecorator(contextlib.ContextDecorator, contextlib.suppress):
@@ -36,6 +36,45 @@ def terminal_newline() -> None:  # TODO: test this line
         print(f"\nPress enter! Newline injection failed: {e}", end="", flush=True)
 
 
+async def _run_interruptible(
+    func: Callable[[], Awaitable[object]],
+) -> outcome.Outcome[object]:
+    # Runs in the Trio thread, inside the task that hosts the console thread.
+    # While the statement runs, control-C should interrupt just this
+    # statement; left to Trio's own handler, it would cancel the whole REPL.
+    from signal import SIGINT, signal
+
+    from trio._core._ki import ki_protection_enabled
+
+    token = trio.lowlevel.current_trio_token()
+    with trio.CancelScope() as scope:
+
+        def handler(sig: int, frame: FrameType | None) -> None:
+            # Mirror Trio's own handler: if the main thread is running the
+            # user's (unprotected) code, raise right here, so that CPU-bound
+            # statements can be interrupted. Otherwise, we may be deep inside
+            # Trio's machinery, so cancel the statement from a safe point.
+            if not ki_protection_enabled(frame):
+                raise KeyboardInterrupt
+            token.run_sync_soon(scope.cancel)
+
+        prev_handler = signal(SIGINT, handler)
+        try:
+            result = await outcome.acapture(func)
+        finally:
+            signal(SIGINT, prev_handler)
+    if (
+        scope.cancel_called
+        and isinstance(result, outcome.Error)
+        and isinstance(result.error, trio.Cancelled)
+    ):
+        # Report it the way the stdlib console does, keeping the traceback
+        # so the user can see where the statement was interrupted.
+        ki = KeyboardInterrupt().with_traceback(result.error.__traceback__)
+        return outcome.Error(ki)
+    return result
+
+
 @final
 class TrioInteractiveConsole(InteractiveConsole):
     def __init__(self, repl_locals: dict[str, object] | None = None) -> None:
@@ -47,7 +86,7 @@ class TrioInteractiveConsole(InteractiveConsole):
     def runcode(self, code: CodeType) -> None:
         func = FunctionType(code, self.locals)
         if inspect.iscoroutinefunction(func):
-            result = trio.from_thread.run(outcome.acapture, func)
+            result = trio.from_thread.run(_run_interruptible, func)
         else:
             result = trio.from_thread.run_sync(outcome.capture, func)
         if isinstance(result, outcome.Error):
@@ -71,55 +110,46 @@ class TrioInteractiveConsole(InteractiveConsole):
                 # We always use sys.excepthook, unlike other implementations.
                 # This means that overriding self.write also does nothing to tbs.
                 sys.excepthook(sys.last_type, sys.last_value, sys.last_traceback)
-        # clear any residual KI
-        trio.from_thread.run(trio.lowlevel.checkpoint_if_cancelled)
-        # trio.from_thread.check_cancelled() has too long of a memory
 
-    if sys.platform == "win32":  # TODO: test this line
+    def raw_input(self, prompt: str = "") -> str:
+        # While we wait at the prompt, control-C is ours to handle: left to
+        # Trio's handler, it would cancel the task hosting the REPL.
+        from signal import SIGINT, signal
 
-        def raw_input(self, prompt: str = "") -> str:
-            try:
-                return input(prompt)
-            except EOFError:
-                # check if trio has a pending KI
-                trio.from_thread.run(trio.lowlevel.checkpoint_if_cancelled)
-                raise
+        assert not self.interrupted
 
-    else:
-
-        def raw_input(self, prompt: str = "") -> str:
-            from signal import SIGINT, signal
-
-            assert not self.interrupted
-
-            def install_handler() -> (
-                Callable[[int, FrameType | None], None] | int | None
-            ):
-                def handler(
-                    sig: int, frame: FrameType | None
-                ) -> None:  # TODO: test this line
-                    self.interrupted = True
+        def install_handler() -> Callable[[int, FrameType | None], None] | int | None:
+            def handler(
+                sig: int, frame: FrameType | None
+            ) -> None:  # TODO: test this line
+                self.interrupted = True
+                if sys.platform != "win32":
+                    # Make input() return, as if the user had pressed enter.
+                    # (On Windows, a control-C in a console makes input()
+                    # raise EOFError by itself; with piped input, the user
+                    # has to press enter.)
                     token.run_sync_soon(terminal_newline, idempotent=True)
 
-                token = trio.lowlevel.current_trio_token()
+            token = trio.lowlevel.current_trio_token()
 
-                return signal(SIGINT, handler)
+            return signal(SIGINT, handler)
 
-            prev_handler = trio.from_thread.run_sync(install_handler)
-            try:
-                return input(prompt)
-            finally:
-                trio.from_thread.run_sync(signal, SIGINT, prev_handler)
-                if self.interrupted:  # TODO: test this line
-                    raise KeyboardInterrupt
-
-        def write(self, output: str) -> None:
+        prev_handler = trio.from_thread.run_sync(install_handler)
+        try:
+            return input(prompt)
+        finally:
+            trio.from_thread.run_sync(signal, SIGINT, prev_handler)
             if self.interrupted:  # TODO: test this line
-                assert output == "\nKeyboardInterrupt\n"
-                sys.stderr.write(output[1:])
-                self.interrupted = False
-            else:
-                sys.stderr.write(output)
+                raise KeyboardInterrupt
+
+    def write(self, output: str) -> None:
+        if self.interrupted:  # TODO: test this line
+            assert output == "\nKeyboardInterrupt\n"
+            # The injected newline already ended the prompt's line.
+            sys.stderr.write(output if sys.platform == "win32" else output[1:])
+            self.interrupted = False
+        else:
+            sys.stderr.write(output)
 
 
 async def run_repl(console: TrioInteractiveConsole) -> None:

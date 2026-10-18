@@ -226,11 +226,9 @@ async def test_wake_token_abort_declined_then_value() -> None:
         scope.cancel()
         token: WakeToken[str] = WakeToken(abort)
         assert await token == "late"
-        # The cancellation is still available to raise by hand, exactly once.
+        # The cancellation is still available to raise by hand.
         with pytest.raises(_core.Cancelled):
             raise token.get_abort_exception()
-        with pytest.raises(RuntimeError, match="more than once"):
-            token.get_abort_exception()
 
 
 async def test_wake_token_misuse() -> None:
@@ -262,32 +260,32 @@ async def test_wake_token_cannot_be_shared_between_tasks() -> None:
         token.reschedule()
 
 
-def test_wake_token_ki_delivered_through_abort() -> None:
+def test_wake_token_deferred_ki_is_a_cancellation() -> None:
     record: list[str] = []
 
     @_core.enable_ki_protection
     async def main() -> None:
-        # We're KI-protected, so this is deferred until we next sleep.
+        # We're KI-protected, so this cancels the main task rather than
+        # raising here, and we see it as soon as we next sleep.
         ki_self()
 
         def abort(token: WakeToken[None]) -> None:
             record.append("abort")
             exc = token.get_abort_exception()
-            assert isinstance(exc, KeyboardInterrupt)
+            assert exc.source == "KeyboardInterrupt"
             token.reschedule(outcome.Error(exc))
 
         token = WakeToken(abort)
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(_core.Cancelled):
             await token
         record.append("after")
-        # get_abort_exception() consumed the pending-KI flag, so this is fine.
-        await _core.checkpoint()
 
-    _core.run(main)
+    with pytest.raises(KeyboardInterrupt):
+        _core.run(main)
     assert record == ["abort", "after"]
 
 
-def test_wake_token_ki_flag_preserved_if_abort_declines() -> None:
+def test_wake_token_deferred_ki_survives_a_declined_abort() -> None:
     @_core.enable_ki_protection
     async def main() -> None:
         ki_self()
@@ -298,45 +296,47 @@ def test_wake_token_ki_flag_preserved_if_abort_declines() -> None:
 
         token: WakeToken[str] = WakeToken(abort)
         assert await token == "ignored"
-        # The interrupt was not lost: it's delivered at the next checkpoint.
-        with pytest.raises(KeyboardInterrupt):
+        # Nothing was lost: the task is still cancelled.
+        with pytest.raises(_core.Cancelled) as excinfo:
             await _core.checkpoint()
+        assert excinfo.value.source == "KeyboardInterrupt"
 
-    _core.run(main)
+    with pytest.raises(KeyboardInterrupt):
+        _core.run(main)
 
 
-async def test_wake_token_abort_exception_is_single_use() -> None:
+async def test_wake_token_abort_exception_can_be_taken_repeatedly() -> None:
     def abort(token: WakeToken[None]) -> None:
-        exc = token.get_abort_exception()
-        assert isinstance(exc, _core.Cancelled)
-        with pytest.raises(RuntimeError, match="more than once"):
-            token.get_abort_exception()
-        token.reschedule(outcome.Error(exc))
+        exc1 = token.get_abort_exception()
+        exc2 = token.get_abort_exception()
+        assert isinstance(exc1, _core.Cancelled)
+        assert isinstance(exc2, _core.Cancelled)
+        # A fresh but equivalent exception each time
+        assert exc1 is not exc2
+        assert (exc1.source, exc1.reason) == (exc2.source, exc2.reason)
+        token.reschedule(outcome.Error(exc1))
 
     with _core.CancelScope() as scope:
         scope.cancel()
         token = WakeToken(abort)
         with pytest.raises(_core.Cancelled):
             await token
-        # Still taken after delivery, so it can't be handed out again later.
-        with pytest.raises(RuntimeError, match="more than once"):
-            token.get_abort_exception()
+        # Still available after delivery
+        with pytest.raises(_core.Cancelled):
+            raise token.get_abort_exception()
 
 
-def test_wake_token_taking_abort_exception_consumes_ki() -> None:
-    @_core.enable_ki_protection
-    async def main() -> None:
-        ki_self()
+async def test_wake_token_declining_after_taking_the_exception() -> None:
+    with _core.CancelScope() as scope:
+        scope.cancel()
 
         def abort(token: WakeToken[str]) -> None:
-            # Taking the exception consumes the interrupt, even if we then
-            # decline to deliver it.
-            assert isinstance(token.get_abort_exception(), KeyboardInterrupt)
+            # Taking the exception doesn't oblige us to deliver it now...
+            assert isinstance(token.get_abort_exception(), _core.Cancelled)
             token.reschedule(outcome.Value("declined"))
 
         token: WakeToken[str] = WakeToken(abort)
         assert await token == "declined"
-        # Nothing is pending any more, so this doesn't raise.
-        await _core.checkpoint()
-
-    _core.run(main)
+        # ...but the task is still cancelled.
+        with pytest.raises(_core.Cancelled):
+            await _core.checkpoint()
