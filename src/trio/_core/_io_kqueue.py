@@ -3,20 +3,19 @@ from __future__ import annotations
 import errno
 import select
 import sys
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, NoReturn, TypeAlias
 
 import attrs
 import outcome
 
 from .. import _core
-from ._run import _public
+from ._run import TASK_STATUS_IGNORED, _public
 from ._wakeup_socketpair import WakeupSocketpair
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable
 
-    from .._core import Abort, RaiseCancelT, Task, UnboundedQueue
+    from .._core import Abort, RaiseCancelT, Task, TaskStatus
     from .._file_io import _HasFileNo
 
 assert not TYPE_CHECKING or (sys.platform != "linux" and sys.platform != "win32")
@@ -34,8 +33,8 @@ class _KqueueStatistics:
 @attrs.define(eq=False)
 class KqueueIOManager:
     _kqueue: select.kqueue = attrs.Factory(select.kqueue)
-    # {(ident, filter): Task or UnboundedQueue}
-    _registered: dict[tuple[int, int], Task | UnboundedQueue[select.kevent]] = (
+    # {(ident, filter): Task, or a monitor_kevent callback}
+    _registered: dict[tuple[int, int], Task | Callable[[select.kevent], object]] = (
         attrs.Factory(dict)
     )
     # Keeps track of whether we are running host callbacks in guest mode
@@ -112,12 +111,13 @@ class KqueueIOManager:
                 # key would be a bug, so let the lookup below fail loudly.
                 continue
             receiver = self._registered[key]
-            if event.flags & select.KQ_EV_ONESHOT:  # TODO: test this branch
-                del self._registered[key]
             if isinstance(receiver, _core.Task):
+                # A task can only be woken once, so it's done with this key.
+                del self._registered[key]
                 _core.reschedule(receiver, outcome.Value(event))
             else:
-                receiver.put_nowait(event)  # TODO: test this line
+                # A monitor stays registered until monitor_kevent() returns.
+                receiver(event)
         self._events_pending = False
         self._deregistered.clear()
 
@@ -137,28 +137,62 @@ class KqueueIOManager:
         """
         return self._kqueue
 
-    @contextmanager
     @_public
-    def monitor_kevent(
+    async def monitor_kevent(
         self,
         ident: int,
         filter: int,
-    ) -> Iterator[_core.UnboundedQueue[select.kevent]]:
+        callback: Callable[[select.kevent], object],
+        *,
+        task_status: TaskStatus[None] = TASK_STATUS_IGNORED,
+    ) -> NoReturn:
         """TODO: these are implemented, but are currently more of a sketch than
         anything real. See `#26
         <https://github.com/python-trio/trio/issues/26>`__.
+
+        Calls ``callback`` with each kevent that arrives for ``(ident,
+        filter)``, until cancelled. The callback runs inside Trio's run loop,
+        not in any task, so it must not block, and should do as little as
+        possible: typically just record the event and wake up a task that's
+        waiting for it. If it raises, monitoring stops and the exception is
+        raised here instead.
+
+        Supports `nursery.start() <trio.Nursery.start>`, reporting itself as
+        started once it's listening, which is the point from which it's safe
+        to register the kevent with the kernel.
         """
         key = (ident, filter)
         if key in self._registered:
             raise _core.BusyResourceError(
                 "attempt to register multiple listeners for same ident/filter pair",
             )
-        q = _core.UnboundedQueue[select.kevent]()
-        self._registered[key] = q
+        task = _core.current_task()
+        active = True
+
+        def abort(_: RaiseCancelT) -> Abort:
+            nonlocal active
+            active = False
+            return _core.Abort.SUCCEEDED
+
+        def deliver(event: select.kevent) -> None:
+            nonlocal active
+            # Once we're on our way out (cancelled, or the callback raised),
+            # any further events are dropped.
+            if not active:
+                return
+            try:
+                callback(event)
+            except BaseException as exc:
+                active = False
+                _core.reschedule(task, outcome.Error(exc))
+
+        self._registered[key] = deliver
         try:
-            yield q
+            task_status.started()
+            await _core.wait_task_rescheduled(abort)
         finally:
             del self._registered[key]
+        raise AssertionError("Should never get here")
 
     @_public
     async def wait_kevent(

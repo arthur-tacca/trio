@@ -279,8 +279,8 @@ anything real. See `#26
 .. autofunction:: wait_kevent(ident, filter, *, fflags=0, data=0)
    :async:
 
-.. autofunction:: monitor_kevent(ident, filter)
-   :with: queue
+.. autofunction:: monitor_kevent(ident, filter, callback, *, task_status=TASK_STATUS_IGNORED)
+   :async:
 
 
 Windows-specific API
@@ -320,8 +320,8 @@ anything real. See `#26
 
 .. autofunction:: current_iocp()
 
-.. autofunction:: monitor_completion_key()
-   :with: queue
+.. autofunction:: monitor_completion_key(callback, *, task_status=TASK_STATUS_IGNORED)
+   :async:
 
 
 Global state: system tasks and run-local variables

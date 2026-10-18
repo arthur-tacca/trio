@@ -7,14 +7,15 @@ import sys
 from typing import TYPE_CHECKING
 
 from ._ki import enable_ki_protection
-from ._run import GLOBAL_RUN_CONTEXT
+from ._run import GLOBAL_RUN_CONTEXT, TASK_STATUS_IGNORED
 
 if TYPE_CHECKING:
     import select
-    from contextlib import AbstractContextManager
+    from collections.abc import Callable
+    from typing import NoReturn
 
-    from .. import _core
     from .._file_io import _HasFileNo
+    from ._run import TaskStatus
 
 assert not TYPE_CHECKING or sys.platform == "darwin"
 
@@ -42,15 +43,32 @@ def current_kqueue() -> select.kqueue:
 
 
 @enable_ki_protection
-def monitor_kevent(
-    ident: int, filter: int
-) -> AbstractContextManager[_core.UnboundedQueue[select.kevent]]:
+async def monitor_kevent(
+    ident: int,
+    filter: int,
+    callback: Callable[[select.kevent], object],
+    *,
+    task_status: TaskStatus[None] = TASK_STATUS_IGNORED,
+) -> NoReturn:
     """TODO: these are implemented, but are currently more of a sketch than
     anything real. See `#26
     <https://github.com/python-trio/trio/issues/26>`__.
+
+    Calls ``callback`` with each kevent that arrives for ``(ident,
+    filter)``, until cancelled. The callback runs inside Trio's run loop,
+    not in any task, so it must not block, and should do as little as
+    possible: typically just record the event and wake up a task that's
+    waiting for it. If it raises, monitoring stops and the exception is
+    raised here instead.
+
+    Supports `nursery.start() <trio.Nursery.start>`, reporting itself as
+    started once it's listening, which is the point from which it's safe
+    to register the kevent with the kernel.
     """
     try:
-        return GLOBAL_RUN_CONTEXT.runner.io_manager.monitor_kevent(ident, filter)
+        await GLOBAL_RUN_CONTEXT.runner.io_manager.monitor_kevent(
+            ident, filter, callback, task_status=task_status
+        )
     except AttributeError:
         raise RuntimeError("must be called from async context") from None
 

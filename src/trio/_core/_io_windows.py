@@ -4,15 +4,15 @@ import enum
 import itertools
 import socket
 import sys
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypeAlias, TypeVar, cast
 
 import attrs
+import outcome
 from outcome import Value
 
 from .. import _core
 from ._io_common import wake_all
-from ._run import _public
+from ._run import TASK_STATUS_IGNORED, _public
 from ._windows_cffi import (
     INVALID_HANDLE_VALUE,
     AFDPollFlags,
@@ -34,13 +34,13 @@ from ._windows_cffi import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
 
     from typing_extensions import Buffer
 
     from .._file_io import _HasFileNo
+    from ._run import TaskStatus
     from ._traps import Abort, RaiseCancelT
-    from ._unbounded_queue import UnboundedQueue
 
 EventResult: TypeAlias = int
 T = TypeVar("T")
@@ -181,7 +181,7 @@ T = TypeVar("T")
 #
 # To handle these, we have monitor_completion_key, where we hand out an
 # unassigned completion key, let users set it up however they want, and then
-# get any events that arrive on that key.
+# call them back with any events that arrive on that key.
 #
 # (Note: monitor_completion_key is not documented or fully baked; expect it to
 # change in the future.)
@@ -449,7 +449,9 @@ class WindowsIOManager:
         self._overlapped_waiters: dict[CData, _core.Task] = {}
         self._posted_too_late_to_cancel: set[CData] = set()
 
-        self._completion_key_queues: dict[int, UnboundedQueue[object]] = {}
+        self._completion_key_callbacks: dict[
+            int, Callable[[CompletionKeyEventInfo], object]
+        ] = {}
         self._completion_key_counter = itertools.count(CKeys.USER_DEFINED)
 
         with socket.socket() as s:
@@ -516,7 +518,7 @@ class WindowsIOManager:
             tasks_waiting_read=tasks_waiting_read,
             tasks_waiting_write=tasks_waiting_write,
             tasks_waiting_overlapped=len(self._overlapped_waiters),
-            completion_key_monitors=len(self._completion_key_queues),
+            completion_key_monitors=len(self._completion_key_callbacks),
         )
 
     def force_wakeup(self) -> None:
@@ -628,14 +630,14 @@ class WindowsIOManager:
                 pass
             else:
                 # dispatch on lpCompletionKey
-                queue = self._completion_key_queues[entry.lpCompletionKey]
+                callback = self._completion_key_callbacks[entry.lpCompletionKey]
                 overlapped = int(ffi.cast("uintptr_t", entry.lpOverlapped))
                 transferred = entry.dwNumberOfBytesTransferred
                 info = CompletionKeyEventInfo(
                     lpOverlapped=overlapped,
                     dwNumberOfBytesTransferred=transferred,
                 )
-                queue.put_nowait(info)
+                callback(info)
 
     def _register_with_iocp(self, handle_: int | CData, completion_key: int) -> None:
         handle = _handle(handle_)
@@ -1019,18 +1021,55 @@ class WindowsIOManager:
         assert self._iocp is not None
         return int(ffi.cast("uintptr_t", self._iocp))
 
-    @contextmanager
     @_public
-    def monitor_completion_key(self) -> Iterator[tuple[int, UnboundedQueue[object]]]:
+    async def monitor_completion_key(
+        self,
+        callback: Callable[[CompletionKeyEventInfo], object],
+        *,
+        task_status: TaskStatus[int] = TASK_STATUS_IGNORED,
+    ) -> NoReturn:
         """TODO: these are implemented, but are currently more of a sketch than
         anything real. See `#26
         <https://github.com/python-trio/trio/issues/26>`__ and `#52
         <https://github.com/python-trio/trio/issues/52>`__.
+
+        Hands out an unused completion key, and calls ``callback`` with a
+        `CompletionKeyEventInfo` for each completion that arrives on it, until
+        cancelled. The callback runs inside Trio's run loop, not in any task,
+        so it must not block, and should do as little as possible: typically
+        just record the event and wake up a task that's waiting for it. If it
+        raises, monitoring stops and the exception is raised here instead.
+
+        The key is handed out through `nursery.start() <trio.Nursery.start>`,
+        which returns it once monitoring has begun::
+
+            key = await nursery.start(trio.lowlevel.monitor_completion_key, callback)
         """
         key = next(self._completion_key_counter)
-        queue = _core.UnboundedQueue[object]()
-        self._completion_key_queues[key] = queue
+        task = _core.current_task()
+        active = True
+
+        def abort(_: RaiseCancelT) -> Abort:
+            nonlocal active
+            active = False
+            return _core.Abort.SUCCEEDED
+
+        def deliver(info: CompletionKeyEventInfo) -> None:
+            nonlocal active
+            # Once we're on our way out (cancelled, or the callback raised),
+            # any further events are dropped.
+            if not active:
+                return
+            try:
+                callback(info)
+            except BaseException as exc:
+                active = False
+                _core.reschedule(task, outcome.Error(exc))
+
+        self._completion_key_callbacks[key] = deliver
         try:
-            yield (key, queue)
+            task_status.started(key)
+            await _core.wait_task_rescheduled(abort)
         finally:
-            del self._completion_key_queues[key]
+            del self._completion_key_callbacks[key]
+        raise AssertionError("Should never get here")

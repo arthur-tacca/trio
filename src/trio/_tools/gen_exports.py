@@ -38,7 +38,7 @@ from ._run import GLOBAL_RUN_CONTEXT
 """
 
 TEMPLATE = """try:
-    return{}GLOBAL_RUN_CONTEXT.{}.{}
+    {}GLOBAL_RUN_CONTEXT.{}.{}
 except AttributeError:
     raise RuntimeError("must be called from async context") from None
 """
@@ -200,8 +200,6 @@ def gen_public_wrappers_source(file: File) -> str:
         # just give errors.
         if "TYPE_CHECKING" not in file.imports:
             header.append("from typing import TYPE_CHECKING\n")
-        if "import sys" not in file.imports:  # pragma: no cover
-            header.append("import sys\n")
         header.append(
             f'\nassert not TYPE_CHECKING or sys.platform=="{file.platform}"\n',
         )
@@ -242,12 +240,15 @@ def gen_public_wrappers_source(file: File) -> str:
         if is_cm:  # pragma: no cover
             func = func.replace("->Iterator", "->AbstractContextManager")
 
-        # Create export function body
-        template = TEMPLATE.format(
-            " await " if isinstance(method, ast.AsyncFunctionDef) else " ",
-            file.modname,
-            method.name + new_args,
+        # Create export function body. A NoReturn method has nothing to
+        # return (and mypy objects to a return statement in such a function).
+        returns_noreturn = (
+            isinstance(method.returns, ast.Name) and method.returns.id == "NoReturn"
         )
+        keyword = "" if returns_noreturn else "return "
+        if isinstance(method, ast.AsyncFunctionDef):
+            keyword += "await "
+        template = TEMPLATE.format(keyword, file.modname, method.name + new_args)
 
         # Assemble function definition arguments and body
         snippet = func + indent(template, " " * 4)
@@ -373,25 +374,36 @@ if TYPE_CHECKING:
 IMPORTS_KQUEUE = """\
 from typing import TYPE_CHECKING
 
+from ._run import TASK_STATUS_IGNORED
+
 if TYPE_CHECKING:
     import select
-    from contextlib import AbstractContextManager
+    from collections.abc import Callable
+    from typing import NoReturn
 
-    from .. import _core
     from .._file_io import _HasFileNo
+    from ._run import TaskStatus
 """
 
 IMPORTS_WINDOWS = """\
 from typing import TYPE_CHECKING
 
+from ._run import TASK_STATUS_IGNORED
+
 if TYPE_CHECKING:
-    from contextlib import AbstractContextManager
+    from collections.abc import Callable
+    from typing import NoReturn
 
     from typing_extensions import Buffer
 
     from .._file_io import _HasFileNo
-    from ._unbounded_queue import UnboundedQueue
+    from ._run import TaskStatus
     from ._windows_cffi import Handle, CData
+
+    # _io_windows is only type-checked on Windows (see its platform assert),
+    # so anything imported from it has to be guarded the same way.
+    if sys.platform == "win32":
+        from ._io_windows import CompletionKeyEventInfo
 """
 
 

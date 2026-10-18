@@ -7,16 +7,22 @@ import sys
 from typing import TYPE_CHECKING
 
 from ._ki import enable_ki_protection
-from ._run import GLOBAL_RUN_CONTEXT
+from ._run import GLOBAL_RUN_CONTEXT, TASK_STATUS_IGNORED
 
 if TYPE_CHECKING:
-    from contextlib import AbstractContextManager
+    from collections.abc import Callable
+    from typing import NoReturn
 
     from typing_extensions import Buffer
 
     from .._file_io import _HasFileNo
-    from ._unbounded_queue import UnboundedQueue
+    from ._run import TaskStatus
     from ._windows_cffi import CData, Handle
+
+    # _io_windows is only type-checked on Windows (see its platform assert),
+    # so anything imported from it has to be guarded the same way.
+    if sys.platform == "win32":
+        from ._io_windows import CompletionKeyEventInfo
 
 assert not TYPE_CHECKING or sys.platform == "win32"
 
@@ -190,15 +196,31 @@ def current_iocp() -> int:
 
 
 @enable_ki_protection
-def monitor_completion_key() -> (
-    AbstractContextManager[tuple[int, UnboundedQueue[object]]]
-):
+async def monitor_completion_key(
+    callback: Callable[[CompletionKeyEventInfo], object],
+    *,
+    task_status: TaskStatus[int] = TASK_STATUS_IGNORED,
+) -> NoReturn:
     """TODO: these are implemented, but are currently more of a sketch than
     anything real. See `#26
     <https://github.com/python-trio/trio/issues/26>`__ and `#52
     <https://github.com/python-trio/trio/issues/52>`__.
+
+    Hands out an unused completion key, and calls ``callback`` with a
+    `CompletionKeyEventInfo` for each completion that arrives on it, until
+    cancelled. The callback runs inside Trio's run loop, not in any task,
+    so it must not block, and should do as little as possible: typically
+    just record the event and wake up a task that's waiting for it. If it
+    raises, monitoring stops and the exception is raised here instead.
+
+    The key is handed out through `nursery.start() <trio.Nursery.start>`,
+    which returns it once monitoring has begun::
+
+        key = await nursery.start(trio.lowlevel.monitor_completion_key, callback)
     """
     try:
-        return GLOBAL_RUN_CONTEXT.runner.io_manager.monitor_completion_key()
+        await GLOBAL_RUN_CONTEXT.runner.io_manager.monitor_completion_key(
+            callback, task_status=task_status
+        )
     except AttributeError:
         raise RuntimeError("must be called from async context") from None

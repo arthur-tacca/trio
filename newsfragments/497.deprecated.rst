@@ -1,0 +1,1 @@
+``trio.lowlevel.UnboundedQueue`` and ``UnboundedQueueStatistics``, deprecated since Trio 0.9.0, have been removed. Use `trio.open_memory_channel` with ``math.inf`` as the buffer size instead.

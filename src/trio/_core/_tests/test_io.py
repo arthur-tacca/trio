@@ -414,7 +414,6 @@ async def test_io_manager_statistics() -> None:
         check(expected_readers=1, expected_writers=0)
 
 
-@pytest.mark.filterwarnings("ignore:.*UnboundedQueue:trio.TrioDeprecationWarning")
 async def test_io_manager_kqueue_monitors_statistics() -> None:
     def check(
         *,
@@ -441,15 +440,77 @@ async def test_io_manager_kqueue_monitors_statistics() -> None:
             # 1 for call_soon_task
             check(expected_monitors=0, expected_readers=1, expected_writers=0)
 
-            with _core.monitor_kevent(a1.fileno(), select.KQ_FILTER_READ):
-                with (
-                    pytest.raises(_core.BusyResourceError),
-                    _core.monitor_kevent(a1.fileno(), select.KQ_FILTER_READ),
-                ):
-                    pass  # pragma: no cover
+            def callback(event: select.kevent) -> None:  # pragma: no cover
+                raise AssertionError("no events expected")
+
+            async with _core.open_nursery() as nursery:
+                await nursery.start(
+                    _core.monitor_kevent, a1.fileno(), select.KQ_FILTER_READ, callback
+                )
+                with pytest.raises(_core.BusyResourceError):
+                    await nursery.start(
+                        _core.monitor_kevent,
+                        a1.fileno(),
+                        select.KQ_FILTER_READ,
+                        callback,
+                    )
                 check(expected_monitors=1, expected_readers=1, expected_writers=0)
+                nursery.cancel_scope.cancel()
 
             check(expected_monitors=0, expected_readers=1, expected_writers=0)
+
+
+async def test_io_manager_kqueue_monitor_callback() -> None:
+    a, b = stdlib_socket.socketpair()
+    with a, b:
+        if sys.platform != "win32" and sys.platform != "linux":
+            received: list[select.kevent] = []
+            got_event = trio.Event()
+
+            def callback(event: select.kevent) -> None:
+                # Called from the run loop, not from a task: just record the
+                # event and wake up the task that's waiting for it.
+                received.append(event)
+                got_event.set()
+
+            # monitor_kevent doesn't register anything with the kernel for us;
+            # that's our job, once it's listening.
+            event = select.kevent(
+                a.fileno(),
+                select.KQ_FILTER_READ,
+                select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            )
+            async with _core.open_nursery() as nursery:
+                await nursery.start(
+                    _core.monitor_kevent, a.fileno(), select.KQ_FILTER_READ, callback
+                )
+                _core.current_kqueue().control([event], 0)
+                b.send(b"x")
+                await got_event.wait()
+                nursery.cancel_scope.cancel()
+
+            assert len(received) == 1
+            assert received[0].ident == a.fileno()
+            assert received[0].filter == select.KQ_FILTER_READ
+
+            # An exception from the callback stops monitoring, and comes out of
+            # monitor_kevent
+            def bad_callback(event: select.kevent) -> None:
+                raise KeyError("boom")
+
+            with pytest.RaisesGroup(KeyError):
+                async with _core.open_nursery() as nursery:
+                    await nursery.start(
+                        _core.monitor_kevent,
+                        a.fileno(),
+                        select.KQ_FILTER_READ,
+                        bad_callback,
+                    )
+                    _core.current_kqueue().control([event], 0)
+                    b.send(b"y")
+                    await trio.sleep_forever()
+
+            assert _core.current_statistics().io_statistics.monitors == 0
 
 
 async def test_can_survive_unnotified_close() -> None:

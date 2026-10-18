@@ -17,13 +17,15 @@ assert (
     sys.platform == "win32" or not TYPE_CHECKING
 )  # Skip type checking when not on Windows
 
-from ... import _core, sleep
+from ... import Event, _core, sleep, sleep_forever
 from ...testing import wait_all_tasks_blocked
 from .tutil import gc_collect_harder, restore_unraisablehook, slow
 
 if TYPE_CHECKING:
     from collections.abc import Generator
     from io import BufferedWriter
+
+    from .._io_windows import CompletionKeyEventInfo
 
 if on_windows:
     from .._windows_cffi import (
@@ -85,37 +87,45 @@ def test_winerror(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exc.value.filename2 == "b/file"
 
 
-# The undocumented API that this is testing should be changed to stop using
-# UnboundedQueue (or just removed until we have time to redo it), but until
-# then we filter out the warning.
-@pytest.mark.filterwarnings("ignore:.*UnboundedQueue:trio.TrioDeprecationWarning")
 async def test_completion_key_listen() -> None:
-    from .. import _io_windows
+    received: list[CompletionKeyEventInfo] = []
+    got_all = Event()
 
-    async def post(key: int) -> None:
-        iocp = Handle(ffi.cast("HANDLE", _core.current_iocp()))
+    def callback(info: CompletionKeyEventInfo) -> None:
+        # Called from the run loop, not from a task: just record the event
+        # and wake up the task that's waiting for it.
+        received.append(info)
+        if len(received) == 10:
+            got_all.set()
+
+    iocp = Handle(ffi.cast("HANDLE", _core.current_iocp()))
+    async with _core.open_nursery() as nursery:
+        key: int = await nursery.start(_core.monitor_completion_key, callback)
         for i in range(10):
             print("post", i)
             if i % 3 == 0:
+                # let some of the events get delivered before we post the rest
                 await _core.checkpoint()
             success = kernel32.PostQueuedCompletionStatus(iocp, i, key, ffi.NULL)
             assert success
+        await got_all.wait()
+        nursery.cancel_scope.cancel()
 
-    with _core.monitor_completion_key() as (key, queue):
+    assert [info.dwNumberOfBytesTransferred for info in received] == list(range(10))
+    assert all(info.lpOverlapped == 0 for info in received)
+
+    # An exception from the callback stops monitoring, and comes out of
+    # monitor_completion_key
+    def bad_callback(info: CompletionKeyEventInfo) -> None:
+        raise KeyError("boom")
+
+    with pytest.RaisesGroup(KeyError):
         async with _core.open_nursery() as nursery:
-            nursery.start_soon(post, key)
-            i = 0
-            print("loop")
-            async for batch in queue:  # pragma: no branch
-                print("got some", batch)
-                for info in batch:
-                    assert isinstance(info, _io_windows.CompletionKeyEventInfo)
-                    assert info.lpOverlapped == 0
-                    assert info.dwNumberOfBytesTransferred == i
-                    i += 1
-                if i == 10:
-                    break
-            print("end loop")
+            key = await nursery.start(_core.monitor_completion_key, bad_callback)
+            assert kernel32.PostQueuedCompletionStatus(iocp, 0, key, ffi.NULL)
+            await sleep_forever()
+
+    assert _core.current_statistics().io_statistics.completion_key_monitors == 0
 
 
 async def test_readinto_overlapped() -> None:
