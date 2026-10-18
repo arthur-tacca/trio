@@ -6,6 +6,7 @@ import attrs
 import pytest
 
 from ... import _abc, _core
+from .._run_context import GLOBAL_RUN_CONTEXT
 from .tutil import check_sequence_matches
 
 if TYPE_CHECKING:
@@ -261,7 +262,7 @@ def test_instrument_that_raises_on_getattr() -> None:
             _core.add_instrument(EvilInstrument())
 
         # Make sure the instrument is fully removed from the per-method lists
-        runner = _core.current_task()._runner
+        runner = GLOBAL_RUN_CONTEXT.runner
         assert "after_run" not in runner.instruments
         assert "task_exited" not in runner.instruments
 

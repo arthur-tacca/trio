@@ -199,7 +199,7 @@ def test_last_minute_gc_edge_case() -> None:
             record.append("cleaned up")
 
     def collect_at_opportune_moment(token: _core._entry_queue.TrioToken) -> None:
-        runner = _core._run.GLOBAL_RUN_CONTEXT.runner
+        runner = _core._run_context.GLOBAL_RUN_CONTEXT.runner
         assert runner.system_nursery is not None
         if runner.system_nursery._closed and isinstance(
             runner.asyncgens.alive,

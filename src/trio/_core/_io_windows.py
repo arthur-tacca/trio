@@ -12,7 +12,7 @@ from outcome import Error, Value
 
 from .. import _core
 from ._io_common import wake_all
-from ._run import TASK_STATUS_IGNORED, _public
+from ._task import TASK_STATUS_IGNORED, _public
 from ._wake_token import WakeToken
 from ._windows_cffi import (
     INVALID_HANDLE_VALUE,
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from typing_extensions import Buffer
 
     from .._file_io import _HasFileNo
-    from ._run import TaskStatus
+    from ._task import TaskStatus
 
 EventResult: TypeAlias = int
 T = TypeVar("T")

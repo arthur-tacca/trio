@@ -22,42 +22,42 @@ from ._ki import currently_ki_protected, disable_ki_protection, enable_ki_protec
 from ._local import RunVar, RunVarToken
 from ._mock_clock import MockClock
 
-# Imports that always exist
-from ._run import (
-    TASK_STATUS_IGNORED,
-    CancelScope,
-    Nursery,
+# Imports that always exist. The core is layered as nurseries (_run) ->
+# runner (_runner) -> tasks/cancellation (_task); see _task.py.
+from ._run import Nursery, open_nursery, run, start_guest_run
+from ._runner import (
     RunStatistics,
-    Task,
-    TaskStatus,
     add_instrument,
-    add_task_exit_callback,
-    checkpoint,
-    checkpoint_if_cancelled,
     current_clock,
-    current_effective_deadline,
     current_root_task,
     current_statistics,
-    current_task,
     current_time,
     current_trio_token,
     in_trio_run,
-    in_trio_task,
     notify_closing,
-    open_nursery,
     remove_instrument,
-    remove_task_exit_callback,
     reschedule,
-    run,
     spawn_system_task,
-    start_guest_run,
     wait_all_tasks_blocked,
     wait_readable,
     wait_writable,
 )
+from ._task import (
+    TASK_STATUS_IGNORED,
+    CancelScope,
+    Task,
+    TaskStatus,
+    add_task_exit_callback,
+    checkpoint,
+    checkpoint_if_cancelled,
+    current_effective_deadline,
+    current_task,
+    in_trio_task,
+    remove_task_exit_callback,
+)
 from ._thread_cache import start_thread_soon
 
-# Has to come after _run to resolve a circular import
+# Has to come after the core layers above to resolve a circular import
 from ._traps import (
     Abort,
     RaiseCancelT,
@@ -73,7 +73,7 @@ from ._wake_token import WakeToken
 if sys.platform == "win32" or (
     not _t.TYPE_CHECKING and "sphinx.ext.autodoc" in sys.modules
 ):
-    from ._run import (
+    from ._runner import (
         current_iocp,
         monitor_completion_key,
         readinto_overlapped,
@@ -85,6 +85,6 @@ if sys.platform == "win32" or (
 if (
     sys.platform != "linux" and sys.platform != "win32" and sys.platform != "android"
 ) or (not _t.TYPE_CHECKING and "sphinx.ext.autodoc" in sys.modules):
-    from ._run import current_kqueue, monitor_kevent, wait_kevent
+    from ._runner import current_kqueue, monitor_kevent, wait_kevent
 
 del sys  # It would be better to import sys as _sys, but mypy does not understand it

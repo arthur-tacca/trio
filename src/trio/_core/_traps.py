@@ -19,25 +19,26 @@ from typing import (  # noqa: UP035
 import attrs
 import outcome
 
-from . import _run
+from . import _task
 from ._exceptions import TrioInternalError
+from ._run_context import GLOBAL_RUN_CONTEXT
 from ._wake_token import WakeToken
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Generator
 
-    from ._run import Task
+    from ._task import Task
 
 RaiseCancelT: TypeAlias = Callable[[], NoReturn]
 
 
 # This class object is used as a singleton.
-# Not exported in the trio._core namespace, but imported directly by _run.
+# Not exported in the trio._core namespace, but imported directly by the runner.
 class CancelShieldedCheckpoint:
     __slots__ = ()
 
 
-# Not exported in the trio._core namespace, but imported directly by _run.
+# Not exported in the trio._core namespace, but imported directly by the runner.
 @attrs.frozen(slots=False)
 class PermanentlyDetachCoroutineObject:
     final_outcome: outcome.Outcome[object]
@@ -268,7 +269,7 @@ async def permanently_detach_coroutine_object(
     uses to resume the coroutine.
 
     """
-    if _run.current_task().child_nurseries:
+    if _task.current_task().child_nurseries:
         raise RuntimeError(
             "can't permanently detach a coroutine object with open nurseries",
         )
@@ -339,6 +340,6 @@ async def reattach_detached_coroutine_object(task: Task, yield_value: object) ->
     # check, so I guess that's OK.
     if not task.coro.cr_running:
         raise RuntimeError("given task does not match calling coroutine")
-    _run.reschedule(task, outcome.Value("reattaching"))
+    GLOBAL_RUN_CONTEXT.runner.reschedule(task, outcome.Value("reattaching"))
     value = await _async_yield(yield_value)
     assert value == outcome.Value("reattaching")

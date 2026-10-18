@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
     from typing_extensions import TypeVar
 
-    from ._run import CancelReason, Task
+    from ._task import CancelReason, Task
 
     # Both type parameters default to None: a bare ``WakeToken`` is a
     # ``WakeToken[None, None]``, and ``WakeToken[T]`` is ``WakeToken[T, None]``.

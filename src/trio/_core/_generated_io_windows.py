@@ -7,7 +7,8 @@ import sys
 from typing import TYPE_CHECKING
 
 from ._ki import enable_ki_protection
-from ._run import GLOBAL_RUN_CONTEXT, TASK_STATUS_IGNORED
+from ._run_context import GLOBAL_RUN_CONTEXT
+from ._task import TASK_STATUS_IGNORED
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
     from typing_extensions import Buffer
 
     from .._file_io import _HasFileNo
-    from ._run import TaskStatus
+    from ._task import TaskStatus
     from ._windows_cffi import CData, Handle
 
     # _io_windows is only type-checked on Windows (see its platform assert),

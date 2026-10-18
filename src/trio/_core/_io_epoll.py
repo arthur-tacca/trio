@@ -10,7 +10,7 @@ import attrs
 
 from .. import _core
 from ._io_common import wake_all
-from ._run import _public
+from ._task import _public
 from ._wake_token import WakeToken
 from ._wakeup_socketpair import WakeupSocketpair
 

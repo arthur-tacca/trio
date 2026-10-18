@@ -473,15 +473,25 @@ The ``_ki.py`` module implements the core infrastructure for safe handling
 of :class:`KeyboardInterrupt`.  It's largely independent of the rest of Trio,
 and could (possibly should?) be extracted into its own independent package.
 
-The most important submodule, where everything is integrated, is
-``_run.py``. (This is also by far the largest submodule; it'd be nice
-to factor bits of it out where possible, but it's tricky because the
-core functionality genuinely is pretty intertwined.) Notably, this is
-where cancel scopes, nurseries, and :class:`~trio.lowlevel.Task` are
-defined; it's also where the scheduler state and :func:`trio.run`
-live.
+The heart of the core is split into three layers, each of which only
+imports from the ones below it:
 
-The one thing that *isn't* in ``_run.py`` is I/O handling. This is
+* ``_task.py`` defines :class:`~trio.lowlevel.Task`, cancel scopes and
+  the deadline bookkeeping, plus the checkpoint functions. It knows
+  nothing about the run loop beyond a few services the runner publishes
+  through the per-thread run context (the current task, the clock, and
+  the deadline registry).
+
+* ``_runner.py`` holds the scheduler state and the run loop. It knows
+  about tasks and cancel scopes, but not about nurseries: the init task
+  that sets up a run's nurseries is handed to it by the layer above,
+  and it only ever reaches a task's parent nursery through a couple of
+  methods.
+
+* ``_run.py`` builds nurseries on top of the runner, and provides
+  :func:`trio.run` and :func:`trio.lowlevel.start_guest_run`.
+
+The one thing that *isn't* in these modules is I/O handling. This is
 delegated to an ``IOManager`` class, of which there are currently
 three implementations:
 

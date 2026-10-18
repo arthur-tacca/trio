@@ -6,7 +6,7 @@ from typing import Generic, TypeVar, cast
 import attrs
 
 from .._util import NoPublicConstructor, final
-from . import _run
+from ._run_context import GLOBAL_RUN_CONTEXT
 
 T = TypeVar("T")
 
@@ -44,7 +44,7 @@ class RunVar(Generic[T]):
     def get(self, default: T | type[_NoValue] = _NoValue) -> T:
         """Gets the value of this :class:`RunVar` for the current run call."""
         try:
-            return cast("T", _run.GLOBAL_RUN_CONTEXT.runner._locals[self])
+            return cast("T", GLOBAL_RUN_CONTEXT.runner._locals[self])
         except AttributeError:
             raise RuntimeError("Cannot be used outside of a run context") from None
         except KeyError:
@@ -71,7 +71,7 @@ class RunVar(Generic[T]):
 
         # This can't fail, because if we weren't in Trio context then the
         # get() above would have failed.
-        _run.GLOBAL_RUN_CONTEXT.runner._locals[self] = value
+        GLOBAL_RUN_CONTEXT.runner._locals[self] = value
         return token
 
     def reset(self, token: RunVarToken[T]) -> None:
@@ -91,9 +91,9 @@ class RunVar(Generic[T]):
         previous = token.previous_value
         try:
             if previous is _NoValue:
-                _run.GLOBAL_RUN_CONTEXT.runner._locals.pop(self)
+                GLOBAL_RUN_CONTEXT.runner._locals.pop(self)
             else:
-                _run.GLOBAL_RUN_CONTEXT.runner._locals[self] = previous
+                GLOBAL_RUN_CONTEXT.runner._locals[self] = previous
         except AttributeError:
             raise RuntimeError("Cannot be used outside of a run context") from None
 

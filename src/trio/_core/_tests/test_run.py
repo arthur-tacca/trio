@@ -31,7 +31,8 @@ from ...testing import (
     assert_checkpoints,
     wait_all_tasks_blocked,
 )
-from .._run import DEADLINE_HEAP_MIN_PRUNE_THRESHOLD, _count_context_run_tb_frames
+from .._runner import _count_context_run_tb_frames
+from .._task import DEADLINE_HEAP_MIN_PRUNE_THRESHOLD
 from .tutil import (
     check_sequence_matches,
     create_asyncio_future_in_new_loop,
@@ -3004,7 +3005,7 @@ def test_context_run_tb_frames() -> None:
         def run(self, fn: Callable[[], object]) -> object:
             return fn()
 
-    with mock.patch("trio._core._run.copy_context", return_value=Context()):
+    with mock.patch("trio._core._runner.copy_context", return_value=Context()):
         assert _count_context_run_tb_frames() == 1
 
 

@@ -195,16 +195,18 @@ async def test_close_at_bad_time_for_receive_some(
         with pytest.raises(_core.ClosedResourceError):
             await r.receive_some(10)
 
-    orig_wait_readable = _core._run.TheIOManager.wait_readable
+    orig_wait_readable = _core._runner.TheIOManager.wait_readable
 
     async def patched_wait_readable(
-        self: _core._run.TheIOManager,
+        self: _core._runner.TheIOManager,
         fd: int | _HasFileNo,
     ) -> None:
         await orig_wait_readable(self, fd)
         await r.aclose()
 
-    monkeypatch.setattr(_core._run.TheIOManager, "wait_readable", patched_wait_readable)
+    monkeypatch.setattr(
+        _core._runner.TheIOManager, "wait_readable", patched_wait_readable
+    )
     s, r = await make_pipe()
     async with s, r:
         async with _core.open_nursery() as nursery:
@@ -226,16 +228,18 @@ async def test_close_at_bad_time_for_send_all(monkeypatch: pytest.MonkeyPatch) -
         with pytest.raises(_core.ClosedResourceError):
             await s.send_all(b"x" * 100)
 
-    orig_wait_writable = _core._run.TheIOManager.wait_writable
+    orig_wait_writable = _core._runner.TheIOManager.wait_writable
 
     async def patched_wait_writable(
-        self: _core._run.TheIOManager,
+        self: _core._runner.TheIOManager,
         fd: int | _HasFileNo,
     ) -> None:
         await orig_wait_writable(self, fd)
         await s.aclose()
 
-    monkeypatch.setattr(_core._run.TheIOManager, "wait_writable", patched_wait_writable)
+    monkeypatch.setattr(
+        _core._runner.TheIOManager, "wait_writable", patched_wait_writable
+    )
     s, r = await make_clogged_pipe()
     async with s, r:
         async with _core.open_nursery() as nursery:

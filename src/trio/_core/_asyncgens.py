@@ -10,7 +10,7 @@ import attrs
 
 from .. import _core
 from .._util import name_asyncgen
-from . import _run
+from ._run_context import GLOBAL_RUN_CONTEXT
 from ._wake_token import WakeToken
 
 # Used to log exceptions in async generator finalizers
@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from types import AsyncGeneratorType
 
     from typing_extensions import ParamSpec
+
+    from ._runner import Runner
 
     _P = ParamSpec("_P")
 
@@ -66,9 +68,9 @@ class AsyncGenerators:
 
     prev_hooks: sys._asyncgen_hooks = attrs.field(init=False)
 
-    def install_hooks(self, runner: _run.Runner) -> None:
+    def install_hooks(self, runner: Runner) -> None:
         def firstiter(agen: AsyncGeneratorType[object, NoReturn]) -> None:
-            if hasattr(_run.GLOBAL_RUN_CONTEXT, "task"):
+            if hasattr(GLOBAL_RUN_CONTEXT, "task"):
                 self.alive.add(agen)
             else:
                 # An async generator first iterated outside of a Trio
@@ -158,7 +160,7 @@ class AsyncGenerators:
         self.prev_hooks = sys.get_asyncgen_hooks()
         sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=finalizer)  # type: ignore[arg-type]  # Finalizer doesn't use AsyncGeneratorType
 
-    async def finalize_remaining(self, runner: _run.Runner) -> None:
+    async def finalize_remaining(self, runner: Runner) -> None:
         # This is called from init after shutting down the system nursery.
         # The only tasks running at this point are init and
         # the run_sync_soon task, and since the system nursery is closed,

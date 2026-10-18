@@ -6,7 +6,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ._ki import enable_ki_protection
-from ._run import _NO_SEND, GLOBAL_RUN_CONTEXT, RunStatistics, Task
+from ._run_context import GLOBAL_RUN_CONTEXT
+from ._runner import _NO_SEND, RunStatistics
 
 if TYPE_CHECKING:
     import contextvars
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
     from .._abc import Clock
     from ._entry_queue import TrioToken
-    from ._run import PosArgT
+    from ._task import PosArgT, Task
 
 
 __all__ = [

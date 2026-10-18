@@ -584,7 +584,7 @@ def test_guest_mode_internal_errors(
     with monkeypatch.context() as m:
 
         async def crash_in_run_loop(in_host: InHost) -> None:
-            m.setattr("trio._core._run.GLOBAL_RUN_CONTEXT.runner.runq", "HI")
+            m.setattr("trio._core._run_context.GLOBAL_RUN_CONTEXT.runner.runq", "HI")
             await trio.sleep(1)
 
         with pytest.raises(trio.TrioInternalError):
@@ -593,7 +593,7 @@ def test_guest_mode_internal_errors(
     with monkeypatch.context() as m:
 
         async def crash_in_io(in_host: InHost) -> None:
-            m.setattr("trio._core._run.TheIOManager.get_events", None)
+            m.setattr("trio._core._runner.TheIOManager.get_events", None)
             await trio.lowlevel.checkpoint()
 
         with pytest.raises(trio.TrioInternalError):
@@ -603,18 +603,18 @@ def test_guest_mode_internal_errors(
 
         async def crash_in_worker_thread_io(in_host: InHost) -> None:
             t = threading.current_thread()
-            old_get_events = trio._core._run.TheIOManager.get_events
+            old_get_events = trio._core._runner.TheIOManager.get_events
 
             def bad_get_events(
-                self: trio._core._run.TheIOManager,
+                self: trio._core._runner.TheIOManager,
                 timeout: float,
-            ) -> trio._core._run.EventResult:
+            ) -> trio._core._runner.EventResult:
                 if threading.current_thread() is not t:
                     raise ValueError("oh no!")
                 else:
                     return old_get_events(self, timeout)
 
-            m.setattr("trio._core._run.TheIOManager.get_events", bad_get_events)
+            m.setattr("trio._core._runner.TheIOManager.get_events", bad_get_events)
 
             await trio.sleep(1)
 

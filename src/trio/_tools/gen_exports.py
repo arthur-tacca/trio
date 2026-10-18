@@ -34,7 +34,7 @@ from __future__ import annotations
 import sys
 
 from ._ki import enable_ki_protection
-from ._run import GLOBAL_RUN_CONTEXT
+from ._run_context import GLOBAL_RUN_CONTEXT
 """
 
 TEMPLATE = """try:
@@ -316,7 +316,7 @@ def main() -> None:  # pragma: no cover
     assert (source_root / "LICENSE").exists()
     core = source_root / "src/trio/_core"
     to_wrap = [
-        File(core / "_run.py", "runner", imports=IMPORTS_RUN),
+        File(core / "_runner.py", "runner", imports=IMPORTS_RUN),
         File(
             core / "_instrumentation.py",
             "runner.instruments",
@@ -352,13 +352,14 @@ from typing import Any, TYPE_CHECKING
 import outcome
 import contextvars
 
-from ._run import _NO_SEND, RunStatistics, Task
+from ._runner import _NO_SEND, RunStatistics
+from ._task import Task
 from ._entry_queue import TrioToken
 from .._abc import Clock
 
 if TYPE_CHECKING:
     from typing_extensions import Unpack
-    from ._run import PosArgT
+    from ._task import PosArgT
 """
 IMPORTS_INSTRUMENT = """\
 from ._instrumentation import Instrument
@@ -374,7 +375,7 @@ if TYPE_CHECKING:
 IMPORTS_KQUEUE = """\
 from typing import TYPE_CHECKING
 
-from ._run import TASK_STATUS_IGNORED
+from ._task import TASK_STATUS_IGNORED
 
 if TYPE_CHECKING:
     import select
@@ -382,13 +383,13 @@ if TYPE_CHECKING:
     from typing import NoReturn
 
     from .._file_io import _HasFileNo
-    from ._run import TaskStatus
+    from ._task import TaskStatus
 """
 
 IMPORTS_WINDOWS = """\
 from typing import TYPE_CHECKING
 
-from ._run import TASK_STATUS_IGNORED
+from ._task import TASK_STATUS_IGNORED
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -397,7 +398,7 @@ if TYPE_CHECKING:
     from typing_extensions import Buffer
 
     from .._file_io import _HasFileNo
-    from ._run import TaskStatus
+    from ._task import TaskStatus
     from ._windows_cffi import Handle, CData
 
     # _io_windows is only type-checked on Windows (see its platform assert),

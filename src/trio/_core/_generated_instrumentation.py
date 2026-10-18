@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ._ki import enable_ki_protection
-from ._run import GLOBAL_RUN_CONTEXT
+from ._run_context import GLOBAL_RUN_CONTEXT
 
 if TYPE_CHECKING:
     from ._instrumentation import Instrument

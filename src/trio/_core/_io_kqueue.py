@@ -9,7 +9,7 @@ import attrs
 import outcome
 
 from .. import _core
-from ._run import TASK_STATUS_IGNORED, _public
+from ._task import TASK_STATUS_IGNORED, _public
 from ._wake_token import WakeToken
 from ._wakeup_socketpair import WakeupSocketpair
 
