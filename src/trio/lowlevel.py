@@ -13,8 +13,6 @@ import typing as _t
 # Generally available symbols
 from ._core import (
     Abort as Abort,
-    ParkingLot as ParkingLot,
-    ParkingLotStatistics as ParkingLotStatistics,
     RaiseCancelT as RaiseCancelT,
     RunStatistics as RunStatistics,
     RunVar as RunVar,
@@ -22,7 +20,7 @@ from ._core import (
     Task as Task,
     TrioToken as TrioToken,
     add_instrument as add_instrument,
-    add_parking_lot_breaker as add_parking_lot_breaker,
+    add_task_exit_callback as add_task_exit_callback,
     cancel_shielded_checkpoint as cancel_shielded_checkpoint,
     checkpoint as checkpoint,
     checkpoint_if_cancelled as checkpoint_if_cancelled,
@@ -40,7 +38,7 @@ from ._core import (
     permanently_detach_coroutine_object as permanently_detach_coroutine_object,
     reattach_detached_coroutine_object as reattach_detached_coroutine_object,
     remove_instrument as remove_instrument,
-    remove_parking_lot_breaker as remove_parking_lot_breaker,
+    remove_task_exit_callback as remove_task_exit_callback,
     reschedule as reschedule,
     spawn_system_task as spawn_system_task,
     start_guest_run as start_guest_run,
@@ -49,6 +47,12 @@ from ._core import (
     wait_readable as wait_readable,
     wait_task_rescheduled as wait_task_rescheduled,
     wait_writable as wait_writable,
+)
+from ._parking_lot import (
+    ParkingLot as ParkingLot,
+    ParkingLotStatistics as ParkingLotStatistics,
+    add_parking_lot_breaker as add_parking_lot_breaker,
+    remove_parking_lot_breaker as remove_parking_lot_breaker,
 )
 from ._subprocess import open_process as open_process
 

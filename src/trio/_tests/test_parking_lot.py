@@ -12,10 +12,10 @@ from trio.lowlevel import (
     remove_parking_lot_breaker,
 )
 
-from ... import _core
-from ...testing import wait_all_tasks_blocked
+from .. import _core
+from .._core._tests.tutil import check_sequence_matches
 from .._parking_lot import ParkingLot
-from .tutil import check_sequence_matches
+from ..testing import wait_all_tasks_blocked
 
 T = TypeVar("T")
 

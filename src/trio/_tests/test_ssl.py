@@ -215,7 +215,7 @@ class PyOpenSSLEchoStream(Stream):
         TRIO_TEST_1_CERT.configure_cert(ctx)
         self._conn = SSL.Connection(ctx, None)
         self._conn.set_accept_state()
-        self._lot = _core.ParkingLot()
+        self._lot = trio.lowlevel.ParkingLot()
         self._pending_cleartext = bytearray()
 
         self._send_all_conflict_detector = ConflictDetector(

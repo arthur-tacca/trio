@@ -45,7 +45,6 @@ from ._exceptions import (
 )
 from ._instrumentation import Instruments
 from ._ki import KIManager, enable_ki_protection
-from ._parking_lot import GLOBAL_PARKING_LOT_BREAKER
 from ._run_context import GLOBAL_RUN_CONTEXT as GLOBAL_RUN_CONTEXT
 from ._thread_cache import start_thread_soon
 from ._traps import (
@@ -1514,6 +1513,9 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
     _child_nurseries: list[Nursery] = attrs.Factory(list)
     _eventual_parent_nursery: Nursery | None = None
 
+    # See add_task_exit_callback(); None once the task has exited.
+    _exit_callbacks: list[Callable[[Task], object]] | None = attrs.Factory(list)
+
     # these are counts of how many cancel/schedule points this task has
     # executed, for assert{_no,}_checkpoints
     # XX maybe these should be exposed as part of a statistics() method?
@@ -2020,11 +2022,13 @@ class Runner:  # type: ignore[explicit-any]
                 )
                 nursery._closed = True
 
-        # break parking lots associated with the exiting task
-        if task in GLOBAL_PARKING_LOT_BREAKER:
-            for lot in GLOBAL_PARKING_LOT_BREAKER[task]:
-                lot.break_lot(task)
-            del GLOBAL_PARKING_LOT_BREAKER[task]
+        # Run the task's exit callbacks (see add_task_exit_callback). Setting
+        # the list to None first is what marks the task as exited.
+        exit_callbacks = task._exit_callbacks
+        task._exit_callbacks = None
+        assert exit_callbacks is not None
+        for callback in exit_callbacks:
+            callback(task)
 
         if (
             task._cancel_status is not None
@@ -2971,6 +2975,52 @@ class _TaskStatusIgnored(TaskStatus[object]):
 
 
 TASK_STATUS_IGNORED: Final[TaskStatus[object]] = _TaskStatusIgnored()
+
+
+def add_task_exit_callback(task: Task, callback: Callable[[Task], object]) -> None:
+    """Arrange for ``callback(task)`` to be called when ``task`` exits.
+
+    The callback runs inside Trio's run loop, with :exc:`KeyboardInterrupt`
+    protection, as soon as the task's coroutine has finished and before the
+    task's parent nursery is told that it's done. It must not block, and it
+    must not raise: an exception from it would crash the whole run.
+
+    This is a low-level hook for bookkeeping that has to happen no matter how
+    a task exits, such as breaking a parking lot that the task was holding
+    (see :func:`add_parking_lot_breaker`). It's not a general-purpose
+    "finally" clause: regular code should use ``try``/``finally`` or a
+    context manager inside the task instead.
+
+    The same callback can be registered any number of times for the same
+    task, and is then called once per registration; each registration can
+    be withdrawn with :func:`remove_task_exit_callback`.
+
+    Raises:
+      RuntimeError: if the task has already exited.
+
+    """
+    if task._exit_callbacks is None:
+        raise RuntimeError(f"{task!r} has already exited")
+    task._exit_callbacks.append(callback)
+
+
+def remove_task_exit_callback(task: Task, callback: Callable[[Task], object]) -> None:
+    """Withdraw one registration made by :func:`add_task_exit_callback`.
+
+    Raises:
+      RuntimeError: if the callback is not registered for the task. (This
+          includes the case where the task has already exited, since by
+          then the callback has been called and the registration is gone.)
+
+    """
+    try:
+        if task._exit_callbacks is None:
+            raise ValueError
+        task._exit_callbacks.remove(callback)
+    except ValueError:
+        raise RuntimeError(
+            f"{callback!r} is not registered as an exit callback for {task!r}",
+        ) from None
 
 
 def current_task() -> Task:

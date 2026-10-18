@@ -490,6 +490,13 @@ Wait queue abstraction
 
 .. autofunction:: remove_parking_lot_breaker
 
+Task exit callbacks
+-------------------
+
+.. autofunction:: add_task_exit_callback
+
+.. autofunction:: remove_task_exit_callback
+
 Low-level checkpoint functions
 ------------------------------
 

@@ -8,7 +8,6 @@ from typing import TypeAlias
 import pytest
 
 from .. import _core
-from .._core._parking_lot import GLOBAL_PARKING_LOT_BREAKER
 from .._sync import *
 from .._timeouts import sleep_forever
 from ..testing import assert_checkpoints, wait_all_tasks_blocked
@@ -673,7 +672,7 @@ async def test_lock_acquire_unowned_lock() -> None:
     """Test that trying to acquire a lock whose owner has exited raises an error.
     see https://github.com/python-trio/trio/issues/3035
     """
-    assert not GLOBAL_PARKING_LOT_BREAKER
+    assert not _core.current_task()._exit_callbacks
     lock = trio.Lock()
     async with trio.open_nursery() as nursery:
         nursery.start_soon(lock.acquire)
@@ -683,13 +682,13 @@ async def test_lock_acquire_unowned_lock() -> None:
         match=f"^Owner of this lock exited without releasing: {owner_str}$",
     ):
         await lock.acquire()
-    assert not GLOBAL_PARKING_LOT_BREAKER
+    assert not _core.current_task()._exit_callbacks
 
 
 async def test_lock_multiple_acquire() -> None:
     """Test for error if awaiting on a lock whose owner exits without releasing.
     see https://github.com/python-trio/trio/issues/3035"""
-    assert not GLOBAL_PARKING_LOT_BREAKER
+    assert not _core.current_task()._exit_callbacks
     lock = trio.Lock()
     with pytest.RaisesGroup(
         pytest.RaisesExc(
@@ -700,33 +699,36 @@ async def test_lock_multiple_acquire() -> None:
         async with trio.open_nursery() as nursery:
             nursery.start_soon(lock.acquire)
             nursery.start_soon(lock.acquire)
-    assert not GLOBAL_PARKING_LOT_BREAKER
+    assert not _core.current_task()._exit_callbacks
 
 
 async def test_lock_handover() -> None:
-    assert not GLOBAL_PARKING_LOT_BREAKER
+    this_task = _core.current_task()
+    assert not this_task._exit_callbacks
     child_task: Task | None = None
     lock = trio.Lock()
 
-    # this task acquires the lock
+    # this task acquires the lock, so it's registered to break the lot on exit
     lock.acquire_nowait()
-    assert {
-        _core.current_task(): [
-            lock._lot,
-        ],
-    } == GLOBAL_PARKING_LOT_BREAKER
+    assert this_task._exit_callbacks == [lock._lot.break_lot]
+
+    async def acquirer() -> None:
+        nonlocal child_task
+        child_task = _core.current_task()
+        await lock.acquire()
 
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(lock.acquire)
+        nursery.start_soon(acquirer)
         await wait_all_tasks_blocked()
+        assert child_task is not None
+        assert not child_task._exit_callbacks
 
-        # hand over the lock to the child task
+        # hand over the lock to the child task, and the breaker role with it
         lock.release()
+        assert not this_task._exit_callbacks
+        assert child_task._exit_callbacks == [lock._lot.break_lot]
 
-        # check values, and get the identifier out of the dict for later check
-        assert len(GLOBAL_PARKING_LOT_BREAKER) == 1
-        child_task = next(iter(GLOBAL_PARKING_LOT_BREAKER))
-        assert GLOBAL_PARKING_LOT_BREAKER[child_task] == [lock._lot]
-
+    # the child exited without releasing, so the lot is broken and the
+    # registration is gone
     assert lock._lot.broken_by == [child_task]
-    assert not GLOBAL_PARKING_LOT_BREAKER
+    assert child_task._exit_callbacks is None

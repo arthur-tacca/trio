@@ -21,8 +21,8 @@
 # theirs and our tasks are lighter, so for us #objects is smaller and #tasks
 # is larger.
 #
-# This is in the core because it's responsible for providing fairness to all
-# of our high-level synchronization primitives (locks, queues, etc.). For now with
+# This is responsible for providing fairness to all of our high-level
+# synchronization primitives (locks, queues, etc.). For now with
 # our FIFO scheduler this is relatively trivial (it's just a FIFO waitqueue),
 # but in the future we ever start support task priorities or fair scheduling
 #
@@ -69,7 +69,6 @@
 # See: https://github.com/python-trio/trio/issues/53
 from __future__ import annotations
 
-import inspect
 import math
 from collections import OrderedDict
 from typing import TYPE_CHECKING
@@ -77,44 +76,40 @@ from typing import TYPE_CHECKING
 import attrs
 import outcome
 
-from .. import _core
-from .._util import final
+from . import _core
+from ._util import final
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from ._run import Task
-
-
-GLOBAL_PARKING_LOT_BREAKER: dict[Task, list[ParkingLot]] = {}
+    from ._core import Task
 
 
 def add_parking_lot_breaker(task: Task, lot: ParkingLot) -> None:
     """Register a task as a breaker for a lot. See :meth:`ParkingLot.break_lot`.
 
+    This is a thin wrapper around :func:`add_task_exit_callback`: when the
+    task exits, ``lot.break_lot(task)`` is called.
+
     raises:
       trio.BrokenResourceError: if the task has already exited.
     """
-    if inspect.getcoroutinestate(task.coro) == inspect.CORO_CLOSED:
-        raise _core._exceptions.BrokenResourceError(
+    try:
+        _core.add_task_exit_callback(task, lot.break_lot)
+    except RuntimeError:
+        raise _core.BrokenResourceError(
             "Attempted to add already exited task as lot breaker.",
-        )
-    if task not in GLOBAL_PARKING_LOT_BREAKER:
-        GLOBAL_PARKING_LOT_BREAKER[task] = [lot]
-    else:
-        GLOBAL_PARKING_LOT_BREAKER[task].append(lot)
+        ) from None
 
 
 def remove_parking_lot_breaker(task: Task, lot: ParkingLot) -> None:
     """Deregister a task as a breaker for a lot. See :meth:`ParkingLot.break_lot`"""
     try:
-        GLOBAL_PARKING_LOT_BREAKER[task].remove(lot)
-    except (KeyError, ValueError):
+        _core.remove_task_exit_callback(task, lot.break_lot)
+    except RuntimeError:
         raise RuntimeError(
             "Attempted to remove task as breaker for a lot it is not registered for",
         ) from None
-    if not GLOBAL_PARKING_LOT_BREAKER[task]:
-        del GLOBAL_PARKING_LOT_BREAKER[task]
 
 
 @attrs.frozen

@@ -8,12 +8,10 @@ import attrs
 import trio
 
 from . import _core
-from ._core import (
-    Abort,
+from ._core import Abort, RaiseCancelT, enable_ki_protection
+from ._parking_lot import (
     ParkingLot,
-    RaiseCancelT,
     add_parking_lot_breaker,
-    enable_ki_protection,
     remove_parking_lot_breaker,
 )
 from ._util import final
@@ -22,7 +20,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from ._core import Task
-    from ._core._parking_lot import ParkingLotStatistics
+    from ._parking_lot import ParkingLotStatistics
 
 
 @attrs.frozen

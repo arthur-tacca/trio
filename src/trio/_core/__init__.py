@@ -21,12 +21,6 @@ from ._exceptions import (
 from ._ki import currently_ki_protected, disable_ki_protection, enable_ki_protection
 from ._local import RunVar, RunVarToken
 from ._mock_clock import MockClock
-from ._parking_lot import (
-    ParkingLot,
-    ParkingLotStatistics,
-    add_parking_lot_breaker,
-    remove_parking_lot_breaker,
-)
 
 # Imports that always exist
 from ._run import (
@@ -37,6 +31,7 @@ from ._run import (
     Task,
     TaskStatus,
     add_instrument,
+    add_task_exit_callback,
     checkpoint,
     checkpoint_if_cancelled,
     current_clock,
@@ -51,6 +46,7 @@ from ._run import (
     notify_closing,
     open_nursery,
     remove_instrument,
+    remove_task_exit_callback,
     reschedule,
     run,
     spawn_system_task,

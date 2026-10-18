@@ -6,6 +6,7 @@ from typing import TypeAlias, TypeVar
 
 from .. import _core, _util
 from .._highlevel_generic import StapledStream
+from .._parking_lot import ParkingLot
 from ..abc import ReceiveStream, SendStream
 
 AsyncHook: TypeAlias = Callable[[], Awaitable[object]]
@@ -24,7 +25,7 @@ class _UnboundedByteQueue:
     def __init__(self) -> None:
         self._data = bytearray()
         self._closed = False
-        self._lot = _core.ParkingLot()
+        self._lot = ParkingLot()
         self._fetch_lock = _util.ConflictDetector(
             "another task is already fetching data",
         )
@@ -466,7 +467,7 @@ class _LockstepByteQueue:
         self._sender_closed = False
         self._receiver_closed = False
         self._receiver_waiting = False
-        self._waiters = _core.ParkingLot()
+        self._waiters = ParkingLot()
         self._send_conflict_detector = _util.ConflictDetector(
             "another task is already sending",
         )
