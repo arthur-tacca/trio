@@ -20,6 +20,8 @@ import attrs
 import outcome
 
 from . import _run
+from ._exceptions import TrioInternalError
+from ._wake_token import WakeToken
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Generator
@@ -37,21 +39,12 @@ class CancelShieldedCheckpoint:
 
 # Not exported in the trio._core namespace, but imported directly by _run.
 @attrs.frozen(slots=False)
-class WaitTaskRescheduled:
-    abort_func: Callable[[RaiseCancelT], Abort]
-
-
-# Not exported in the trio._core namespace, but imported directly by _run.
-@attrs.frozen(slots=False)
 class PermanentlyDetachCoroutineObject:
     final_outcome: outcome.Outcome[object]
 
 
 MessageType: TypeAlias = (
-    type[CancelShieldedCheckpoint]
-    | WaitTaskRescheduled
-    | PermanentlyDetachCoroutineObject
-    | object
+    type[CancelShieldedCheckpoint] | PermanentlyDetachCoroutineObject | object
 )
 
 
@@ -117,9 +110,10 @@ async def wait_task_rescheduled(  # type: ignore[explicit-any]
 ) -> Any:
     """Put the current task to sleep, with cancellation support.
 
-    This is the lowest-level API for blocking in Trio. Every time a
-    :class:`~trio.lowlevel.Task` blocks, it does so by calling this function
-    (usually indirectly via some higher-level API).
+    This is the older, callback-style interface for blocking in Trio. It's
+    now a thin wrapper around :class:`WakeToken`, which is what every
+    :class:`~trio.lowlevel.Task` ultimately blocks on, and which new code
+    should use directly.
 
     This is a tricky interface with no guard rails. If you can use
     :class:`ParkingLot` or the built-in I/O wait functions instead, then you
@@ -171,8 +165,8 @@ async def wait_task_rescheduled(  # type: ignore[explicit-any]
        operation was actually cancelled or not.)  To report a delayed
        cancellation, then you should reschedule the task yourself, and call
        the ``raise_cancel`` callback passed to ``abort_func`` to raise a
-       :exc:`~trio.Cancelled` (or possibly :exc:`KeyboardInterrupt`) exception
-       into this task. Either of the approaches sketched below can work::
+       :exc:`~trio.Cancelled` exception into this task. Either of the
+       approaches sketched below can work::
 
           # Option 1:
           # Catch the exception from raise_cancel and inject it into the task.
@@ -213,7 +207,39 @@ async def wait_task_rescheduled(  # type: ignore[explicit-any]
        above about how you should use a higher-level API if at all possible?
 
     """
-    return (await _async_yield(WaitTaskRescheduled(abort_func))).unwrap()
+    return await legacy_wake_token(abort_func)
+
+
+def _make_raise_cancel(token: WakeToken[object]) -> RaiseCancelT:
+    """Build a legacy-style ``raise_cancel`` callback for ``token``.
+
+    Legacy code may call it any number of times, now or later; each call
+    raises a fresh, equivalent exception. The exception is deliberately not
+    bound to a name here, so that this frame doesn't keep it alive when it
+    raises.
+    """
+
+    def raise_cancel() -> NoReturn:
+        raise token.get_cancelled_exception()
+
+    return raise_cancel
+
+
+def legacy_wake_token(
+    abort_func: Callable[[RaiseCancelT], Abort],
+) -> WakeToken[object]:
+    """Wrap a :func:`wait_task_rescheduled`-style abort function in a
+    :class:`WakeToken`, preserving the legacy abort protocol."""
+
+    def on_cancel(token: WakeToken[object]) -> None:
+        result = abort_func(_make_raise_cancel(token))
+        if type(result) is not Abort:
+            raise TrioInternalError("abort function must return Abort enum")
+        if result is Abort.SUCCEEDED:
+            token.reschedule_cancelled()
+        # Abort.FAILED: stay asleep; the owner will call reschedule() later.
+
+    return WakeToken(on_cancel)
 
 
 async def permanently_detach_coroutine_object(
@@ -284,7 +310,7 @@ async def temporarily_detach_coroutine_object(
     uses to resume the coroutine.
 
     """
-    return await _async_yield(WaitTaskRescheduled(abort_func))
+    return await _async_yield(legacy_wake_token(abort_func))
 
 
 async def reattach_detached_coroutine_object(task: Task, yield_value: object) -> None:

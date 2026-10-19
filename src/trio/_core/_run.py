@@ -48,10 +48,8 @@ from ._ki import KIManager, enable_ki_protection
 from ._run_context import GLOBAL_RUN_CONTEXT as GLOBAL_RUN_CONTEXT
 from ._thread_cache import start_thread_soon
 from ._traps import (
-    Abort,
     CancelShieldedCheckpoint,
     PermanentlyDetachCoroutineObject,
-    WaitTaskRescheduled,
     cancel_shielded_checkpoint,
 )
 from ._wake_token import WakeToken
@@ -1497,10 +1495,12 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
     #   it should be written in C if you don't want to pollute Trio
     #   tracebacks with extraneous frames.
     # - for scheduled tasks, custom_sleep_data is None
+    # - _sleeping_on is the WakeToken the task is blocked on (directly, or
+    #   via wait_task_rescheduled), or None once it has been rescheduled
     # Tasks start out unscheduled.
     _next_send_fn: Callable[[Any], object] | None = None  # type: ignore[explicit-any]
     _next_send: Outcome[Any] | BaseException | None = None  # type: ignore[explicit-any]
-    _abort_func: Callable[[_core.RaiseCancelT], Abort] | None = None
+    _sleeping_on: WakeToken[Any, Any] | None = None  # type: ignore[explicit-any]
     custom_sleep_data: Any = None  # type: ignore[explicit-any]
 
     # For introspection and nursery.start()
@@ -1619,44 +1619,22 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
             if self._cancel_status.effectively_cancelled:
                 self._attempt_delivery_of_any_pending_cancel()
 
-    def _attempt_abort(self, raise_cancel: _core.RaiseCancelT) -> None:
-        # Either the abort succeeds, in which case we will reschedule the
-        # task, or else it fails, in which case it will worry about
-        # rescheduling itself (hopefully eventually calling reraise to raise
-        # the given exception, but not necessarily).
-
-        # This is only called by the functions immediately below, which both check
-        # `self.abort_func is not None`.
-        assert self._abort_func is not None, "FATAL INTERNAL ERROR"
-
-        success = self._abort_func(raise_cancel)
-        if type(success) is not Abort:
-            raise TrioInternalError("abort function must return Abort enum")
-        # We only attempt to abort once per blocking call, regardless of
-        # whether we succeeded or failed.
-        self._abort_func = None
-        if success is Abort.SUCCEEDED:
-            self._runner.reschedule(self, capture(raise_cancel))
-
     def _attempt_delivery_of_any_pending_cancel(self) -> None:
-        if self._abort_func is None:
+        # If the task is sleeping, hand the cancellation to the WakeToken it's
+        # sleeping on. Its on_cancel either delivers it (by rescheduling the
+        # token with it), or declines, in which case the token will be
+        # rescheduled by "someone" later. Either way, we only request
+        # cancellation once per blocking call.
+        token = self._sleeping_on
+        if token is None or token._cancel_requested:
             return
         if not self._cancel_status.effectively_cancelled:
             return
 
         reason = self._cancel_status._scope._cancel_reason
-
-        def raise_cancel() -> NoReturn:
-            if reason is None:
-                raise Cancelled._create(source="unknown", reason="misnesting")
-            else:
-                raise Cancelled._create(
-                    source=reason.source,
-                    reason=reason.reason,
-                    source_task=reason.source_task,
-                )
-
-        self._attempt_abort(raise_cancel)
+        if reason is None:
+            reason = CancelReason(source="unknown", reason="misnesting")
+        token._request_cancel(reason)
 
 
 ################################################################
@@ -1898,7 +1876,8 @@ class Runner:  # type: ignore[explicit-any]
 
         Args:
           task (trio.lowlevel.Task): the task to be rescheduled. Must be blocked
-              in a call to :func:`wait_task_rescheduled`.
+              in a call to :func:`wait_task_rescheduled` (or awaiting a
+              :class:`WakeToken`).
           next_send (outcome.Outcome): the value (or error) to return (or
               raise) from :func:`wait_task_rescheduled`.
 
@@ -1906,17 +1885,48 @@ class Runner:  # type: ignore[explicit-any]
         if next_send is _NO_SEND:
             next_send = Value(None)
 
+        token = task._sleeping_on
+        if token is None:
+            raise RuntimeError(
+                f"{task!r} is not blocked in wait_task_rescheduled "
+                "or awaiting a WakeToken",
+            )
+        token.reschedule(next_send)
+
+    def _enqueue(
+        self,
+        task: Task,
+        next_send: Outcome[object] | BaseException | None,
+    ) -> None:
+        # Make a task runnable, sending it next_send when it next runs. This
+        # is the low-level operation behind WakeToken.reschedule(): anything
+        # that wakes a sleeping task goes through its token (reschedule()
+        # included), so that the token's bookkeeping stays in step. The other
+        # callers here are starting a task, or waking one that isn't sleeping
+        # on a token at all.
         assert task._runner is self
         assert task._next_send_fn is None
         task._next_send_fn = task.coro.send
         task._next_send = next_send
-        task._abort_func = None
+        task._sleeping_on = None
         task.custom_sleep_data = None
         if not self.runq and self.is_guest:
             self.force_guest_tick_asap()
         self.runq.append(task)
         if "task_scheduled" in self.instruments:
             self.instruments.call("task_scheduled", task)
+
+    def _block_task_on(  # type: ignore[explicit-any]
+        self,
+        task: Task,
+        token: WakeToken[Any, Any],
+    ) -> None:
+        # The task just yielded this token to the run loop: bind them
+        # together, and see whether there's already a cancellation to deliver.
+        task._cancel_points += 1
+        token._task = task
+        task._sleeping_on = token
+        task._attempt_delivery_of_any_pending_cancel()
 
     def spawn_impl(
         self,
@@ -1993,7 +2003,7 @@ class Runner:  # type: ignore[explicit-any]
             self.instruments.call("task_spawned", task)
         # Special case: normally next_send should be an Outcome, but for the
         # very first send we have to send a literal unboxed None.
-        self.reschedule(task, None)  # type: ignore[arg-type]
+        self._enqueue(task, None)
         return task
 
     def task_exited(self, task: Task, outcome: Outcome[object]) -> None:
@@ -2907,11 +2917,9 @@ def unrolled_run(
                 else:
                     task._schedule_points += 1
                     if msg is CancelShieldedCheckpoint:
-                        runner.reschedule(task)
-                    elif type(msg) is WaitTaskRescheduled:
-                        task._cancel_points += 1
-                        task._abort_func = msg.abort_func
-                        task._attempt_delivery_of_any_pending_cancel()
+                        runner._enqueue(task, Value(None))
+                    elif type(msg) is WakeToken:
+                        runner._block_task_on(task, msg)
                     elif type(msg) is PermanentlyDetachCoroutineObject:
                         # Pretend the task just exited with the given outcome
                         runner.task_exited(task, msg.final_outcome)
@@ -2926,7 +2934,7 @@ def unrolled_run(
                         # protocol of unwrapping whatever outcome gets sent in.
                         # Instead, we'll arrange to throw `exc` in directly,
                         # which works for at least asyncio and curio.
-                        runner.reschedule(task, exc)  # type: ignore[arg-type]
+                        runner._enqueue(task, exc)
                         task._next_send_fn = task.coro.throw
                     # prevent long-lived reference
                     # TODO: develop test for this deletion

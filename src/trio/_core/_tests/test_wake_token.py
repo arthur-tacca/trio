@@ -340,3 +340,82 @@ async def test_wake_token_declining_after_taking_the_exception() -> None:
         # ...but the task is still cancelled.
         with pytest.raises(_core.Cancelled):
             await _core.checkpoint()
+
+
+# The legacy wait_task_rescheduled()/reschedule() API is a shim over WakeToken.
+
+
+async def test_public_reschedule_routes_through_the_token() -> None:
+    record: list[int] = []
+    sleeping: list[_core.Task] = []
+
+    async def waiter() -> None:
+        sleeping.append(_core.current_task())
+        token: WakeToken[int] = WakeToken(no_cancel)
+        record.append(await token)
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        await wait_all_tasks_blocked()
+        (task,) = sleeping
+        _core.reschedule(task, outcome.Value(7))
+        # Already woken: the task is no longer blocked on anything.
+        with pytest.raises(RuntimeError, match="not blocked"):
+            _core.reschedule(task, outcome.Value(8))
+    assert record == [7]
+    with pytest.raises(RuntimeError, match="not blocked"):
+        _core.reschedule(_core.current_task())
+
+
+async def test_legacy_abort_may_peek_then_succeed() -> None:
+    def abort(raise_cancel: _core.RaiseCancelT) -> _core.Abort:
+        with pytest.raises(_core.Cancelled):
+            raise_cancel()  # legacy code may inspect before deciding
+        return _core.Abort.SUCCEEDED
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(_core.Cancelled):
+            await _core.wait_task_rescheduled(abort)
+
+
+async def test_legacy_raise_cancel_can_be_called_repeatedly() -> None:
+    task = _core.current_task()
+    trio_token = _core.current_trio_token()
+    saved: list[_core.RaiseCancelT] = []
+
+    def abort(raise_cancel: _core.RaiseCancelT) -> _core.Abort:
+        saved.append(raise_cancel)
+        trio_token.run_sync_soon(_core.reschedule, task, outcome.Value("woken"))
+        return _core.Abort.FAILED
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        assert await _core.wait_task_rescheduled(abort) == "woken"
+        seen = set()
+        for _ in range(3):  # e.g. from_thread.check_cancelled() polls like this
+            with pytest.raises(_core.Cancelled) as excinfo:
+                saved[0]()
+            seen.add((excinfo.value.source, excinfo.value.reason))
+        assert len(seen) == 1  # re-created exceptions are equivalent
+
+
+def test_legacy_abort_sees_deferred_ki_as_cancellation() -> None:
+    @_core.enable_ki_protection
+    async def main() -> None:
+        ki_self()
+
+        def abort(raise_cancel: _core.RaiseCancelT) -> _core.Abort:
+            with pytest.raises(_core.Cancelled) as excinfo:
+                raise_cancel()
+            assert excinfo.value.source == "KeyboardInterrupt"
+            # Trio then calls raise_cancel again to build the outcome, and
+            # gets an equivalent exception.
+            return _core.Abort.SUCCEEDED
+
+        with pytest.raises(_core.Cancelled) as excinfo:
+            await _core.wait_task_rescheduled(abort)
+        assert excinfo.value.source == "KeyboardInterrupt"
+
+    with pytest.raises(KeyboardInterrupt):
+        _core.run(main)

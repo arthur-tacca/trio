@@ -115,7 +115,8 @@ def reschedule(task: Task, next_send: outcome.Outcome[object] = _NO_SEND) -> Non
 
     Args:
       task (trio.lowlevel.Task): the task to be rescheduled. Must be blocked
-          in a call to :func:`wait_task_rescheduled`.
+          in a call to :func:`wait_task_rescheduled` (or awaiting a
+          :class:`WakeToken`).
       next_send (outcome.Outcome): the value (or error) to return (or
           raise) from :func:`wait_task_rescheduled`.
 

@@ -565,6 +565,9 @@ Low-level blocking
 .. autoclass:: WakeToken
    :members:
 
+The older callback-style interface is still available, and is now
+implemented on top of :class:`WakeToken`:
+
 .. autofunction:: wait_task_rescheduled
 .. autoclass:: Abort
 .. autofunction:: reschedule
