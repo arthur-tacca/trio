@@ -1,0 +1,342 @@
+from __future__ import annotations
+
+import signal
+from typing import TypeVar
+
+import outcome
+import pytest
+
+from ... import _core
+from ...testing import assert_checkpoints, wait_all_tasks_blocked
+from .._wake_token import WakeToken
+from .tutil import check_sequence_matches
+
+T = TypeVar("T")
+D = TypeVar("D")
+
+
+def ki_self() -> None:
+    signal.raise_signal(signal.SIGINT)
+
+
+def no_abort(token: WakeToken[T, D]) -> None:  # pragma: no cover
+    raise AssertionError("abort_func should not have been called")
+
+
+def abort_now(token: WakeToken[T, D]) -> None:
+    token.reschedule_aborted()
+
+
+class Lot:
+    """A stand-in for something that keeps track of its waiters."""
+
+    def __init__(self) -> None:
+        self.waiting: set[WakeToken[None, Lot]] = set()
+
+
+async def test_wake_token_data() -> None:
+    # No data: it's None, and so is its type parameter
+    plain: WakeToken[int] = WakeToken(no_abort)
+    assert plain.data is None
+
+    # Data is handed to the abort function through the token, with its type
+    lot = Lot()
+
+    def abort(token: WakeToken[None, Lot]) -> None:
+        token.data.waiting.remove(token)
+        token.reschedule_aborted()
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        token = WakeToken(abort, lot)
+        assert token.data is lot
+        lot.waiting.add(token)
+        with pytest.raises(_core.Cancelled):
+            await token
+    assert not lot.waiting
+
+    # And it can be reassigned, e.g. when a waiter is moved somewhere else
+    other = Lot()
+    token2 = WakeToken(abort, lot)
+    token2.data = other
+    assert token2.data is other
+
+
+async def test_wake_token_reschedule_without_argument() -> None:
+    # A token whose value type is None can be woken without an outcome
+    token = WakeToken(no_abort)
+    record: list[object] = []
+
+    async def waiter() -> None:
+        # mypy objects to using an awaited None, but that's the value under test
+        record.append(await token)  # type: ignore[func-returns-value]
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        await wait_all_tasks_blocked()
+        token.reschedule()
+    assert record == [None]
+
+    # ...and so can one whose value type merely includes None
+    token2: WakeToken[int | None] = WakeToken(no_abort)
+
+    async def waiter2() -> None:
+        record.append(await token2)
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter2)
+        await wait_all_tasks_blocked()
+        token2.reschedule()
+    assert record == [None, None]
+
+
+async def test_wake_token_reschedule_rejects_non_outcomes() -> None:
+    # Untyped callers get a clear error, rather than the sleeping task
+    # choking on whatever they passed
+    token = WakeToken(no_abort)
+
+    async def waiter() -> None:
+        await token
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        await wait_all_tasks_blocked()
+        with pytest.raises(TypeError, match=r"needs an outcome\.Outcome"):
+            token.reschedule(None)  # type: ignore[call-overload]
+        with pytest.raises(TypeError, match=r"needs an outcome\.Outcome"):
+            token.reschedule(42)  # type: ignore[call-overload]
+        token.reschedule()
+
+
+async def test_wake_token_task_accessor() -> None:
+    token = WakeToken(no_abort)
+    with pytest.raises(RuntimeError, match="hasn't been awaited yet"):
+        _ = token.task
+
+    seen: list[_core.Task] = []
+
+    async def waiter() -> None:
+        seen.append(_core.current_task())
+        await token
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        await wait_all_tasks_blocked()
+        assert token.task is seen[0]
+        token.reschedule()
+    # Still available after the wake-up, for whoever wants to know who it was
+    assert token.task is seen[0]
+
+
+async def test_wake_token_abort_func_is_reassignable() -> None:
+    record: list[str] = []
+
+    def first(token: WakeToken[None]) -> None:  # pragma: no cover
+        record.append("first")
+        token.reschedule_aborted()
+
+    def second(token: WakeToken[None]) -> None:
+        record.append("second")
+        token.reschedule_aborted()
+
+    with _core.CancelScope() as scope:
+        token = WakeToken(first)
+        token.abort_func = second
+        scope.cancel()
+        with pytest.raises(_core.Cancelled):
+            await token
+    assert record == ["second"]
+
+
+async def test_wake_token_value_and_error() -> None:
+    record: list[object] = []
+
+    async def waiter(token: WakeToken[object]) -> None:
+        record.append("sleeping")
+        try:
+            record.append(await token)
+        except KeyError as exc:
+            record.append(exc)
+
+    t1: WakeToken[object] = WakeToken(no_abort)
+    t2: WakeToken[object] = WakeToken(no_abort)
+    assert repr(t1).endswith("not awaited>")
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter, t1)
+        nursery.start_soon(waiter, t2)
+        await wait_all_tasks_blocked()
+        assert record == ["sleeping", "sleeping"]
+        assert "awaited by" in repr(t1)
+        err = KeyError("boom")
+        t1.reschedule(outcome.Value(1))
+        t2.reschedule(outcome.Error(err))
+        assert "rescheduled" in repr(t1)
+        await wait_all_tasks_blocked()
+    # Both waiters wake in the same scheduler pass, in either order.
+    check_sequence_matches(record, ["sleeping", "sleeping", {1, err}])
+
+
+async def test_wake_token_is_a_checkpoint() -> None:
+    token = WakeToken(abort_now)
+    _core.current_trio_token().run_sync_soon(token.reschedule)
+    with assert_checkpoints():
+        await token
+
+
+async def test_wake_token_abort_immediately() -> None:
+    record: list[object] = []
+
+    def abort(token: WakeToken[object]) -> None:
+        record.append(token)
+        assert "abort requested" in repr(token)
+        token.reschedule_aborted()
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        token: WakeToken[object] = WakeToken(abort)
+        with pytest.raises(_core.Cancelled):
+            await token
+    assert record == [token]
+
+
+async def test_wake_token_abort_deferred() -> None:
+    trio_token = _core.current_trio_token()
+    record: list[str] = []
+
+    def abort(token: WakeToken[object]) -> None:
+        record.append("abort")
+        trio_token.run_sync_soon(token.reschedule_aborted)
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        token: WakeToken[object] = WakeToken(abort)
+        with pytest.raises(_core.Cancelled):
+            await token
+    assert record == ["abort"]
+
+
+async def test_wake_token_abort_declined_then_value() -> None:
+    trio_token = _core.current_trio_token()
+
+    def abort(token: WakeToken[str]) -> None:
+        # Decline the abort: the operation "completes" a little later.
+        trio_token.run_sync_soon(token.reschedule, outcome.Value("late"))
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        token: WakeToken[str] = WakeToken(abort)
+        assert await token == "late"
+        # The cancellation is still available to raise by hand, exactly once.
+        with pytest.raises(_core.Cancelled):
+            raise token.get_abort_exception()
+        with pytest.raises(RuntimeError, match="more than once"):
+            token.get_abort_exception()
+
+
+async def test_wake_token_misuse() -> None:
+    token = WakeToken(abort_now)
+    with pytest.raises(RuntimeError, match="before the token was awaited"):
+        token.reschedule()
+    with pytest.raises(RuntimeError, match="before any abort was requested"):
+        token.get_abort_exception()
+
+    _core.current_trio_token().run_sync_soon(token.reschedule)
+    await token
+    with pytest.raises(RuntimeError, match="only be awaited once"):
+        await token
+    with pytest.raises(RuntimeError, match="more than once"):
+        token.reschedule()
+
+
+async def test_wake_token_cannot_be_shared_between_tasks() -> None:
+    token = WakeToken(abort_now)
+
+    async def waiter() -> None:
+        await token
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        await wait_all_tasks_blocked()
+        with pytest.raises(RuntimeError, match="only be awaited once"):
+            await token
+        token.reschedule()
+
+
+def test_wake_token_ki_delivered_through_abort() -> None:
+    record: list[str] = []
+
+    @_core.enable_ki_protection
+    async def main() -> None:
+        # We're KI-protected, so this is deferred until we next sleep.
+        ki_self()
+
+        def abort(token: WakeToken[None]) -> None:
+            record.append("abort")
+            exc = token.get_abort_exception()
+            assert isinstance(exc, KeyboardInterrupt)
+            token.reschedule(outcome.Error(exc))
+
+        token = WakeToken(abort)
+        with pytest.raises(KeyboardInterrupt):
+            await token
+        record.append("after")
+        # get_abort_exception() consumed the pending-KI flag, so this is fine.
+        await _core.checkpoint()
+
+    _core.run(main)
+    assert record == ["abort", "after"]
+
+
+def test_wake_token_ki_flag_preserved_if_abort_declines() -> None:
+    @_core.enable_ki_protection
+    async def main() -> None:
+        ki_self()
+
+        def abort(token: WakeToken[str]) -> None:
+            # Decline, without ever calling get_abort_exception().
+            token.reschedule(outcome.Value("ignored"))
+
+        token: WakeToken[str] = WakeToken(abort)
+        assert await token == "ignored"
+        # The interrupt was not lost: it's delivered at the next checkpoint.
+        with pytest.raises(KeyboardInterrupt):
+            await _core.checkpoint()
+
+    _core.run(main)
+
+
+async def test_wake_token_abort_exception_is_single_use() -> None:
+    def abort(token: WakeToken[None]) -> None:
+        exc = token.get_abort_exception()
+        assert isinstance(exc, _core.Cancelled)
+        with pytest.raises(RuntimeError, match="more than once"):
+            token.get_abort_exception()
+        token.reschedule(outcome.Error(exc))
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        token = WakeToken(abort)
+        with pytest.raises(_core.Cancelled):
+            await token
+        # Still taken after delivery, so it can't be handed out again later.
+        with pytest.raises(RuntimeError, match="more than once"):
+            token.get_abort_exception()
+
+
+def test_wake_token_taking_abort_exception_consumes_ki() -> None:
+    @_core.enable_ki_protection
+    async def main() -> None:
+        ki_self()
+
+        def abort(token: WakeToken[str]) -> None:
+            # Taking the exception consumes the interrupt, even if we then
+            # decline to deliver it.
+            assert isinstance(token.get_abort_exception(), KeyboardInterrupt)
+            token.reschedule(outcome.Value("declined"))
+
+        token: WakeToken[str] = WakeToken(abort)
+        assert await token == "declined"
+        # Nothing is pending any more, so this doesn't raise.
+        await _core.checkpoint()
+
+    _core.run(main)

@@ -349,6 +349,7 @@ def test_static_tool_sees_class_members(
         ignore_names = set(dir(type(class_))) | {
             "__annotations__",
             "__attrs_attrs__",
+            "__attrs_init__",
             "__attrs_own_setattr__",
             "__callable_proto_members_only__",
             "__class_getitem__",

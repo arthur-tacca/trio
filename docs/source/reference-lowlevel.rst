@@ -560,6 +560,9 @@ make sure that the call always acts as a checkpoint, it calls
 Low-level blocking
 ------------------
 
+.. autoclass:: WakeToken
+   :members:
+
 .. autofunction:: wait_task_rescheduled
 .. autoclass:: Abort
 .. autofunction:: reschedule

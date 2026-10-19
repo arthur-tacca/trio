@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import enum
+from typing import TYPE_CHECKING, Generic, cast, overload
+
+import attrs
+import outcome
+
+from .. import _core
+from .._util import final
+from ._exceptions import Cancelled
+from ._ki import enable_ki_protection
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator
+
+    from typing_extensions import TypeVar
+
+    from ._run import Task
+    from ._traps import Abort, RaiseCancelT
+
+    # Both type parameters default to None: a bare ``WakeToken`` is a
+    # ``WakeToken[None, None]``, and ``WakeToken[T]`` is ``WakeToken[T, None]``.
+    T = TypeVar("T", default=None)
+    D = TypeVar("D", default=None)
+    # A method-scoped stand-in for T, for the constructor overload that pins
+    # D to None (type checkers don't allow a class's own type parameters in
+    # the self annotation of __init__).
+    T1 = TypeVar("T1", default=None)
+else:
+    from typing import TypeVar
+
+    # At runtime there are no defaults, so subscript with both parameters (or,
+    # better, only in annotations).
+    T = TypeVar("T")
+    D = TypeVar("D")
+    T1 = TypeVar("T1")
+
+
+class _AbortState(enum.Enum):
+    """Sentinels sharing the ``_raise_cancel`` slot with the callback."""
+
+    NOT_REQUESTED = enum.auto()
+    TAKEN = enum.auto()
+
+
+class _NoSend(enum.Enum):
+    """Sentinel for :meth:`WakeToken.reschedule` being called without an
+    outcome. Private, so callers can't pass it; the overloads say when it's
+    allowed to be left out."""
+
+    NO_SEND = enum.auto()
+
+
+@final
+@attrs.define(eq=False, repr=False, init=False)
+class WakeToken(Generic[T, D]):
+    """A single-use handle for putting the current task to sleep and waking
+    it up again, without handing out the :class:`Task` object.
+
+    ``await token`` blocks the current task until some other code calls
+    :meth:`reschedule` on the token, and then returns (or raises) whatever
+    that call passed in. A token can be awaited exactly once, by exactly one
+    task.
+
+    Args:
+      abort_func: Called with the token as its only argument if a
+          cancellation (or :exc:`KeyboardInterrupt`) needs to be delivered
+          while the token is being awaited. It should clean up whatever
+          state refers to the token, and then either:
+
+          * call :meth:`reschedule_aborted` (now or later) to deliver the
+            cancellation, or
+
+          * do nothing, in which case the token must still be rescheduled by
+            "someone" as normal, and the awaiting task can call
+            :meth:`get_abort_exception` afterwards if it wants to raise the
+            cancellation itself.
+
+          It's a plain attribute, so it can be replaced while the token is
+          outstanding.
+      data: Anything the code that puts the task to sleep wants to share
+          with the code that wakes it up or aborts it. Trio never looks at
+          it. It can only be left out when its type parameter is None, which
+          is the default: ``WakeToken(abort)`` is a ``WakeToken[T, None]``
+          with ``data`` None, and ``WakeToken(abort, lot)`` is a
+          ``WakeToken[T, Lot]``.
+
+    The exception to deliver is not materialised until
+    :meth:`get_abort_exception` is called, because producing it has side
+    effects (in particular, it clears Trio's pending-KeyboardInterrupt flag).
+    So if ``abort_func`` declines to abort, the interrupt is delivered at the
+    task's next checkpoint instead of being lost. Taking the exception
+    consumes the interrupt, so it can be taken at most once, and whoever
+    takes it is responsible for delivering it.
+
+    Example, a minimal event::
+
+        class Event:
+            def __init__(self):
+                self._flag = False
+                self._waiting = set()
+
+            def set(self):
+                self._flag = True
+                for token in self._waiting:
+                    token.reschedule()
+                self._waiting.clear()
+
+            async def wait(self):
+                if self._flag:
+                    await trio.lowlevel.checkpoint()
+                    return
+
+                def abort(token):
+                    token.data._waiting.remove(token)
+                    token.reschedule_aborted()
+
+                token = trio.lowlevel.WakeToken(abort, self)
+                self._waiting.add(token)
+                await token
+
+    """
+
+    abort_func: Callable[[WakeToken[T, D]], None]
+    data: D
+    # The task awaiting us, or None until __await__ is called.
+    _task: Task | None = attrs.field(init=False)
+    # NOT_REQUESTED until Trio asks us to abort; then the raise_cancel
+    # callback, saved so that get_abort_exception() can produce the
+    # exception lazily; then TAKEN once it has handed the exception out.
+    _raise_cancel: RaiseCancelT | _AbortState = attrs.field(init=False)
+    _rescheduled: bool = attrs.field(init=False)
+
+    # The constructor is written out rather than generated by attrs so that
+    # it can be overloaded: ``data`` may only be left out when D is None.
+    @overload
+    def __init__(
+        self: WakeToken[T1, None],
+        abort_func: Callable[[WakeToken[T1, None]], None],
+    ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        abort_func: Callable[[WakeToken[T, D]], None],
+        data: D,
+    ) -> None: ...
+    def __init__(  # type: ignore[misc]  # mypy doesn't follow the self type of the first overload
+        self,
+        abort_func: Callable[[WakeToken[T, D]], None],
+        data: D | None = None,
+    ) -> None:
+        self.abort_func = abort_func
+        # Only ever None when D is None, per the overloads above.
+        self.data = cast("D", data)
+        self._task = None
+        self._raise_cancel = _AbortState.NOT_REQUESTED
+        self._rescheduled = False
+
+    @property
+    def task(self) -> Task:
+        """The task awaiting this token.
+
+        For debugging and introspection. It's set when the token is awaited,
+        and stays set after the token has been rescheduled, so a waker can
+        still see who it woke.
+
+        Raises:
+          RuntimeError: if the token hasn't been awaited yet.
+        """
+        if self._task is None:
+            raise RuntimeError("this WakeToken hasn't been awaited yet")
+        return self._task
+
+    def __repr__(self) -> str:
+        if self._task is None:
+            state = "not awaited"
+        elif self._rescheduled:
+            state = f"rescheduled, was awaited by {self._task.name!r}"
+        else:
+            state = f"awaited by {self._task.name!r}"
+        if self._raise_cancel is _AbortState.TAKEN:
+            state += ", abort exception taken"
+        elif self._raise_cancel is not _AbortState.NOT_REQUESTED:
+            state += ", abort requested"
+        return f"<WakeToken at {id(self):#x}: {state}>"
+
+    # __await__ must return an iterator (Python rejects an ``async def``
+    # here with "__await__() returned a coroutine"), so this is a generator
+    # that delegates to the trap's awaitable.
+    @enable_ki_protection
+    def __await__(self) -> Generator[object, None, T]:
+        if self._task is not None:
+            raise RuntimeError("a WakeToken can only be awaited once")
+        self._task = _core.current_task()
+
+        def abort_wrapper(raise_cancel: RaiseCancelT) -> Abort:
+            self._raise_cancel = raise_cancel
+            self.abort_func(self)
+            # We never let Trio raise the cancellation for us: either
+            # abort_func already called reschedule_aborted(), or it has
+            # arranged for the token to be rescheduled some other way.
+            return _core.Abort.FAILED
+
+        trap = _core.wait_task_rescheduled(abort_wrapper)
+        return (yield from trap.__await__())  # type: ignore[no-any-return]
+
+    # The outcome may only be left out when None is a valid value for the
+    # token, i.e. its value type is None or a union including it.
+    @overload
+    def reschedule(self: WakeToken[T | None, D]) -> None: ...
+    @overload
+    def reschedule(self, next_send: outcome.Outcome[T]) -> None: ...
+    @enable_ki_protection
+    def reschedule(
+        self,
+        next_send: outcome.Outcome[T] | _NoSend = _NoSend.NO_SEND,
+    ) -> None:
+        """Wake the task awaiting this token, making ``await token`` return
+        (or raise) ``next_send``.
+
+        ``next_send`` can be left out if the token's value type is (or
+        includes) None, in which case the task is woken with
+        ``outcome.Value(None)``.
+
+        Must be called exactly once, after the token has been awaited.
+        """
+        to_send: outcome.Outcome[object]
+        if next_send is _NoSend.NO_SEND:
+            to_send = outcome.Value(None)
+        elif isinstance(next_send, outcome.Outcome):
+            to_send = next_send
+        else:
+            raise TypeError(
+                f"WakeToken.reschedule() needs an outcome.Outcome, not {next_send!r}",
+            )
+        if self._task is None:
+            raise RuntimeError(
+                "WakeToken.reschedule() called before the token was awaited",
+            )
+        if self._rescheduled:
+            raise RuntimeError("WakeToken.reschedule() called more than once")
+        self._rescheduled = True
+        _core.reschedule(self._task, to_send)
+
+    def get_abort_exception(self) -> Cancelled | KeyboardInterrupt:
+        """Take the exception that the pending abort wants delivered.
+
+        Can only be called after ``abort_func`` has been called, and at most
+        once per token: taking the exception consumes the pending
+        cancellation or interrupt, so whoever takes it must deliver it, by
+        raising it or passing it to :meth:`reschedule`
+        (:meth:`reschedule_aborted` does both). A second call raises
+        :exc:`RuntimeError` rather than silently consuming a newer interrupt.
+        """
+        raise_cancel = self._raise_cancel
+        if raise_cancel is _AbortState.NOT_REQUESTED:
+            raise RuntimeError(
+                "WakeToken.get_abort_exception() called before any abort was requested",
+            )
+        if raise_cancel is _AbortState.TAKEN:
+            raise RuntimeError(
+                "WakeToken.get_abort_exception() called more than once",
+            )
+        self._raise_cancel = _AbortState.TAKEN
+        try:
+            raise_cancel()
+        except (Cancelled, KeyboardInterrupt) as exc:
+            return exc
+
+    @enable_ki_protection
+    def reschedule_aborted(self) -> None:
+        """Wake the awaiting task with the cancellation that ``abort_func``
+        was asked to deliver. Convenience for the common case."""
+        self.reschedule(outcome.Error(self.get_abort_exception()))

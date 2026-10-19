@@ -67,6 +67,7 @@ from ._traps import (
     temporarily_detach_coroutine_object,
     wait_task_rescheduled,
 )
+from ._wake_token import WakeToken
 
 # Windows imports
 if sys.platform == "win32" or (

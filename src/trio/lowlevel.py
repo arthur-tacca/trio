@@ -19,6 +19,7 @@ from ._core import (
     RunVarToken as RunVarToken,
     Task as Task,
     TrioToken as TrioToken,
+    WakeToken as WakeToken,
     add_instrument as add_instrument,
     add_task_exit_callback as add_task_exit_callback,
     cancel_shielded_checkpoint as cancel_shielded_checkpoint,
