@@ -53,8 +53,8 @@ from ._traps import (
     PermanentlyDetachCoroutineObject,
     WaitTaskRescheduled,
     cancel_shielded_checkpoint,
-    wait_task_rescheduled,
 )
+from ._wake_token import WakeToken
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup
@@ -1178,6 +1178,10 @@ def open_nursery(
     return NurseryManager(strict_exception_groups=strict_exception_groups)
 
 
+def _cancel_ignored(token: WakeToken[RetT]) -> None:
+    """A WakeToken on_cancel callback that declines to deliver the cancellation."""
+
+
 @final
 class Nursery(metaclass=NoPublicConstructor):
     """A context which may be used to spawn (or cancel) child tasks.
@@ -1223,7 +1227,9 @@ class Nursery(metaclass=NoPublicConstructor):
         # nursery's 'async with' block, which acts like a child Task in all
         # the ways we can make it.
         self._nested_child_running = True
-        self._parent_waiting_in_aexit = False
+        # The token the parent is blocked on in __aexit__, waiting for the
+        # children to finish, if it is.
+        self._parent_aexit_token: WakeToken[None] | None = None
         self._pending_starts = 0
         self._closed = False
 
@@ -1245,9 +1251,10 @@ class Nursery(metaclass=NoPublicConstructor):
     def _check_nursery_closed(self) -> None:
         if not any([self._nested_child_running, self._children, self._pending_starts]):
             self._closed = True
-            if self._parent_waiting_in_aexit:
-                self._parent_waiting_in_aexit = False
-                GLOBAL_RUN_CONTEXT.runner.reschedule(self._parent_task)
+            token = self._parent_aexit_token
+            if token is not None:
+                self._parent_aexit_token = None
+                token.reschedule()
 
     def _child_finished(
         self,
@@ -1290,11 +1297,10 @@ class Nursery(metaclass=NoPublicConstructor):
         if not self._closed:
             # Being cancelled while we wait for our children changes nothing:
             # they're being cancelled too, and we still have to wait for them.
-            def aborted(_: _core.RaiseCancelT) -> Abort:
-                return Abort.FAILED
-
-            self._parent_waiting_in_aexit = True
-            await wait_task_rescheduled(aborted)
+            # So the token's on_cancel just ignores the request.
+            token = WakeToken(_cancel_ignored)
+            self._parent_aexit_token = token
+            await token
         else:
             # Nothing to wait for, so execute a schedule point, but don't
             # allow us to be cancelled, just like the other branch.  We
@@ -2299,15 +2305,15 @@ class Runner:  # type: ignore[explicit-any]
                          print("FAIL")
 
         """
-        task = current_task()
-        key = (cushion, id(task))
-        self.waiting_for_idle[key] = task
 
-        def abort(_: _core.RaiseCancelT) -> Abort:
+        def on_cancel(token: WakeToken[None]) -> None:
             del self.waiting_for_idle[key]
-            return Abort.SUCCEEDED
+            token.reschedule_cancelled()
 
-        await wait_task_rescheduled(abort)
+        token = WakeToken(on_cancel)
+        key = (cushion, id(token))
+        self.waiting_for_idle[key] = token
+        await token
 
 
 ################################################################
@@ -2798,10 +2804,10 @@ def unrolled_run(
             if idle_primed is not None and not runner.runq and not events:
                 if idle_primed is IdlePrimedTypes.WAITING_FOR_IDLE:
                     while runner.waiting_for_idle:
-                        key, task = runner.waiting_for_idle.peekitem(0)
+                        key, token = runner.waiting_for_idle.peekitem(0)
                         if key[0] == cushion:
                             del runner.waiting_for_idle[key]
-                            runner.reschedule(task)
+                            token.reschedule()
                         else:
                             break
                 else:
@@ -3099,7 +3105,9 @@ async def checkpoint() -> None:
         assert task._cancel_status._scope._cancel_reason is not None
         cs._cancel_reason = task._cancel_status._scope._cancel_reason
         with cs:
-            await _core.wait_task_rescheduled(lambda _: _core.Abort.SUCCEEDED)
+            # Nothing to clean up on cancellation: on_cancel just delivers it.
+            token = WakeToken(WakeToken.reschedule_cancelled)
+            await token
 
 
 async def checkpoint_if_cancelled() -> None:

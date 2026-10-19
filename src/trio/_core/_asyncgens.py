@@ -11,6 +11,7 @@ import attrs
 from .. import _core
 from .._util import name_asyncgen
 from . import _run
+from ._wake_token import WakeToken
 
 # Used to log exceptions in async generator finalizers
 ASYNCGEN_LOGGER = logging.getLogger("trio.async_generator_errors")
@@ -172,10 +173,11 @@ class AsyncGenerators:
 
         # Process all pending run_sync_soon callbacks, in case one of
         # them was an asyncgen finalizer that snuck in under the wire.
-        runner.entry_queue.run_sync_soon(runner.reschedule, runner.init_task)
-        await _core.wait_task_rescheduled(
-            lambda _: _core.Abort.FAILED,  # pragma: no cover
+        token = WakeToken(
+            lambda token: None,  # pragma: no cover  # not cancellable here
         )
+        runner.entry_queue.run_sync_soon(token.reschedule)
+        await token
         self.alive.update(self.trailing_needs_finalize)
         self.trailing_needs_finalize.clear()
 

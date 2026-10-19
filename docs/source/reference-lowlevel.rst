@@ -569,33 +569,32 @@ Low-level blocking
 .. autoclass:: Abort
 .. autofunction:: reschedule
 
-Here's an example lock class implemented using
-:func:`wait_task_rescheduled` directly. This implementation has a
-number of flaws, including lack of fairness, O(n) cancellation,
-missing error checking, failure to insert a checkpoint on the
-non-blocking path, etc. If you really want to implement your own lock,
-then you should study the implementation of :class:`trio.Lock` and use
-:class:`ParkingLot`, which handles some of these issues for you. But
-this does serve to illustrate the basic structure of the
-:func:`wait_task_rescheduled` API:
+Here's an example lock class implemented using :class:`WakeToken`
+directly. This implementation has a number of flaws, including lack of
+fairness, O(n) cancellation, missing error checking, failure to insert
+a checkpoint on the non-blocking path, etc. If you really want to
+implement your own lock, then you should study the implementation of
+:class:`trio.Lock` and use :class:`ParkingLot`, which handles some of
+these issues for you. But this does serve to illustrate the basic
+structure of the :class:`WakeToken` API:
 
 .. code-block:: python
 
    class NotVeryGoodLock:
        def __init__(self):
-           self._blocked_tasks = collections.deque()
+           self._blocked = collections.deque()
            self._held = False
 
        async def acquire(self):
            # We might have to try several times to acquire the lock.
            while self._held:
                # Someone else has the lock, so we have to wait.
-               task = trio.lowlevel.current_task()
-               self._blocked_tasks.append(task)
-               def abort_fn(_):
-                   self._blocked_tasks.remove(task)
-                   return trio.lowlevel.Abort.SUCCEEDED
-               await trio.lowlevel.wait_task_rescheduled(abort_fn)
+               def on_cancel(token):
+                   self._blocked.remove(token)
+                   token.reschedule_cancelled()
+               token = trio.lowlevel.WakeToken(on_cancel)
+               self._blocked.append(token)
+               await token
                # At this point the lock was released -- but someone else
                # might have swooped in and taken it again before we
                # woke up. So we loop around to check the 'while' condition
@@ -607,9 +606,9 @@ this does serve to illustrate the basic structure of the
 
        def release(self):
            self._held = False
-           if self._blocked_tasks:
-               woken_task = self._blocked_tasks.popleft()
-               trio.lowlevel.reschedule(woken_task)
+           if self._blocked:
+               woken = self._blocked.popleft()
+               woken.reschedule()
 
 
 Task API

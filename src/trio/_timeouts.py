@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, NoReturn
 
 import trio
 
+from ._core import WakeToken
+
 if TYPE_CHECKING:
     from collections.abc import Generator
 
@@ -68,7 +70,9 @@ async def sleep_forever() -> NoReturn:
       RuntimeError: if rescheduled
 
     """
-    await trio.lowlevel.wait_task_rescheduled(lambda _: trio.lowlevel.Abort.SUCCEEDED)
+    # There's nothing to clean up on cancellation: on_cancel just delivers it.
+    token = WakeToken(WakeToken.reschedule_cancelled)
+    await token
     raise RuntimeError("Should never have been rescheduled!")
 
 

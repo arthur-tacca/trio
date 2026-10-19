@@ -13,6 +13,7 @@ from outcome import Value
 from .. import _core
 from ._io_common import wake_all
 from ._run import TASK_STATUS_IGNORED, _public
+from ._wake_token import WakeToken
 from ._windows_cffi import (
     INVALID_HANDLE_VALUE,
     AFDPollFlags,
@@ -40,7 +41,6 @@ if TYPE_CHECKING:
 
     from .._file_io import _HasFileNo
     from ._run import TaskStatus
-    from ._traps import Abort, RaiseCancelT
 
 EventResult: TypeAlias = int
 T = TypeVar("T")
@@ -240,8 +240,8 @@ WRITABLE_FLAGS = (
 # operation and start a new one.
 @attrs.define(eq=False)
 class AFDWaiters:
-    read_task: _core.Task | None = None
-    write_task: _core.Task | None = None
+    read_waiter: WakeToken[None] | None = None
+    write_waiter: WakeToken[None] | None = None
     current_op: AFDPollOp | None = None
 
 
@@ -445,8 +445,8 @@ class WindowsIOManager:
         # {socket handle: AFDWaiters}
         self._afd_waiters: dict[Handle, AFDWaiters] = {}
 
-        # {lpOverlapped: task}
-        self._overlapped_waiters: dict[CData, _core.Task] = {}
+        # {lpOverlapped: the WakeToken of the task blocked in wait_overlapped}
+        self._overlapped_waiters: dict[CData, WakeToken[CompletionKeyEventInfo]] = {}
         self._posted_too_late_to_cancel: set[CData] = set()
 
         self._completion_key_callbacks: dict[
@@ -510,9 +510,9 @@ class WindowsIOManager:
         tasks_waiting_read = 0
         tasks_waiting_write = 0
         for waiter in self._afd_waiters.values():
-            if waiter.read_task is not None:
+            if waiter.read_waiter is not None:
                 tasks_waiting_read += 1
-            if waiter.write_task is not None:
+            if waiter.write_waiter is not None:
                 tasks_waiting_write += 1
         return _WindowsStatistics(
             tasks_waiting_read=tasks_waiting_read,
@@ -575,12 +575,12 @@ class WindowsIOManager:
                         code = ntdll.RtlNtStatusToDosError(lpo.Internal)
                         raise_winerror(code)
                     flags = op.poll_info.Handles[0].Events
-                    if waiters.read_task and flags & READABLE_FLAGS:
-                        _core.reschedule(waiters.read_task)
-                        waiters.read_task = None
-                    if waiters.write_task and flags & WRITABLE_FLAGS:
-                        _core.reschedule(waiters.write_task)
-                        waiters.write_task = None
+                    if waiters.read_waiter and flags & READABLE_FLAGS:
+                        waiters.read_waiter.reschedule()
+                        waiters.read_waiter = None
+                    if waiters.write_waiter and flags & WRITABLE_FLAGS:
+                        waiters.write_waiter.reschedule()
+                        waiters.write_waiter = None
                     self._refresh_afd(op.poll_info.Handles[0].Handle)
             elif entry.lpCompletionKey == CKeys.WAIT_OVERLAPPED:
                 # Regular I/O event, dispatch on lpOverlapped
@@ -591,9 +591,9 @@ class WindowsIOManager:
                     lpOverlapped=overlapped,
                     dwNumberOfBytesTransferred=transferred,
                 )
-                _core.reschedule(waiter, Value(info))
+                waiter.reschedule(Value(info))
             elif entry.lpCompletionKey == CKeys.LATE_CANCEL:
-                # Post made by a regular I/O event's abort_fn
+                # Post made by a regular I/O event's on_cancel
                 # after it failed to cancel the I/O. If we still
                 # have a waiter with this lpOverlapped, we didn't
                 # get the regular I/O completion and almost
@@ -610,7 +610,7 @@ class WindowsIOManager:
                     pass
                 else:
                     exc = _core.TrioInternalError(
-                        f"Failed to cancel overlapped I/O in {waiter.name} and didn't "
+                        f"Failed to cancel overlapped I/O in {waiter.task.name} and didn't "
                         "receive the completion either. Did you forget to "
                         "call register_with_iocp()?",
                     )
@@ -624,7 +624,7 @@ class WindowsIOManager:
                     # task traceback. If you're debugging this
                     # error and can't tell where it's coming from,
                     # try changing this line to
-                    # _core.reschedule(waiter, outcome.Error(exc))
+                    # waiter.reschedule(outcome.Error(exc))
                     raise exc
             elif entry.lpCompletionKey == CKeys.FORCE_WAKEUP:
                 pass
@@ -658,7 +658,12 @@ class WindowsIOManager:
     # AFD stuff
     ################################################################
 
-    def _refresh_afd(self, base_handle: Handle) -> None:
+    def _refresh_afd(
+        self,
+        base_handle: Handle,
+        *,
+        own: WakeToken[None] | None = None,
+    ) -> None:
         waiters = self._afd_waiters[base_handle]
         if waiters.current_op is not None:
             afd_group = waiters.current_op.afd_group
@@ -679,9 +684,9 @@ class WindowsIOManager:
             self._vacant_afd_groups.add(afd_group)
 
         flags = 0
-        if waiters.read_task is not None:
+        if waiters.read_waiter is not None:
             flags |= READABLE_FLAGS
-        if waiters.write_task is not None:
+        if waiters.write_waiter is not None:
             flags |= WRITABLE_FLAGS
 
         if not flags:
@@ -725,8 +730,9 @@ class WindowsIOManager:
                     # to re-issue the call. Clear our state and wake up any
                     # pending calls.
                     del self._afd_waiters[base_handle]
-                    # Do this last, because it could raise.
-                    wake_all(waiters, exc)
+                    # Do this last, because it could raise (if the caller's
+                    # own token is among the waiters, see _afd_poll).
+                    wake_all(waiters, exc, own=own)
                     return
             op = AFDPollOp(lpOverlapped, poll_info, waiters, afd_group)
             waiters.current_op = op
@@ -743,17 +749,18 @@ class WindowsIOManager:
             self._afd_waiters[base_handle] = waiters
         if getattr(waiters, mode) is not None:
             raise _core.BusyResourceError
-        setattr(waiters, mode, _core.current_task())
-        # Could potentially raise if the handle is somehow invalid; that's OK,
-        # we let it escape.
-        self._refresh_afd(base_handle)
 
-        def abort_fn(_: RaiseCancelT) -> Abort:
+        def on_cancel(token: WakeToken[None]) -> None:
             setattr(waiters, mode, None)
             self._refresh_afd(base_handle)
-            return _core.Abort.SUCCEEDED
+            token.reschedule_cancelled()
 
-        await _core.wait_task_rescheduled(abort_fn)
+        token = WakeToken(on_cancel)
+        setattr(waiters, mode, token)
+        # Could potentially raise if the handle is somehow invalid; that's OK,
+        # we let it escape (after it's woken up the other waiter, if any).
+        self._refresh_afd(base_handle, own=token)
+        await token
 
     @_public
     async def wait_readable(self, sock: _HasFileNo | int) -> None:
@@ -778,7 +785,7 @@ class WindowsIOManager:
             if another task calls :func:`notify_closing` while this
             function is still working.
         """
-        await self._afd_poll(sock, "read_task")
+        await self._afd_poll(sock, "read_waiter")
 
     @_public
     async def wait_writable(self, sock: _HasFileNo | int) -> None:
@@ -793,7 +800,7 @@ class WindowsIOManager:
             if another task calls :func:`notify_closing` while this
             function is still working.
         """
-        await self._afd_poll(sock, "write_task")
+        await self._afd_poll(sock, "write_waiter")
 
     @_public
     def notify_closing(self, handle: Handle | int | _HasFileNo) -> None:
@@ -845,7 +852,7 @@ class WindowsIOManager:
         self,
         handle_: int | CData,
         lpOverlapped: CData | int,
-    ) -> object:
+    ) -> CompletionKeyEventInfo:
         """TODO: these are implemented, but are currently more of a sketch than
         anything real. See `#26
         <https://github.com/python-trio/trio/issues/26>`__ and `#52
@@ -858,13 +865,11 @@ class WindowsIOManager:
             raise _core.BusyResourceError(
                 "another task is already waiting on that lpOverlapped",
             )
-        task = _core.current_task()
-        self._overlapped_waiters[lpOverlapped] = task
-        raise_cancel = None
+        cancel_requested = False
 
-        def abort(raise_cancel_: RaiseCancelT) -> Abort:
-            nonlocal raise_cancel
-            raise_cancel = raise_cancel_
+        def on_cancel(token: WakeToken[CompletionKeyEventInfo]) -> None:
+            nonlocal cancel_requested
+            cancel_requested = True
             try:
                 _check(kernel32.CancelIoEx(handle, lpOverlapped))
             except OSError as exc:
@@ -899,10 +904,12 @@ class WindowsIOManager:
                     raise _core.TrioInternalError(
                         "CancelIoEx failed with unexpected error",
                     ) from exc
-            return _core.Abort.FAILED
+            # Either way, the cancellation isn't delivered here: the I/O's
+            # completion wakes us up as usual, and we deal with it below.
 
-        # TODO: what type does this return?
-        info = await _core.wait_task_rescheduled(abort)
+        token: WakeToken[CompletionKeyEventInfo] = WakeToken(on_cancel)
+        self._overlapped_waiters[lpOverlapped] = token
+        info = await token
         lpOverlappedTyped = cast("_Overlapped", lpOverlapped)
         if lpOverlappedTyped.Internal != 0:
             # the lpOverlapped reports the error as an NT status code,
@@ -910,8 +917,8 @@ class WindowsIOManager:
             # it will produce the right sorts of exceptions
             code = ntdll.RtlNtStatusToDosError(lpOverlappedTyped.Internal)
             if code == ErrorCodes.ERROR_OPERATION_ABORTED:
-                if raise_cancel is not None:
-                    raise_cancel()
+                if cancel_requested:
+                    raise token.get_cancelled_exception()
                 else:
                     # We didn't request this cancellation, so assume
                     # it happened due to the underlying handle being
@@ -1046,13 +1053,14 @@ class WindowsIOManager:
             key = await nursery.start(trio.lowlevel.monitor_completion_key, callback)
         """
         key = next(self._completion_key_counter)
-        task = _core.current_task()
         active = True
 
-        def abort(_: RaiseCancelT) -> Abort:
+        def on_cancel(token: WakeToken[None]) -> None:
             nonlocal active
             active = False
-            return _core.Abort.SUCCEEDED
+            token.reschedule_cancelled()
+
+        token = WakeToken(on_cancel)
 
         def deliver(info: CompletionKeyEventInfo) -> None:
             nonlocal active
@@ -1064,12 +1072,12 @@ class WindowsIOManager:
                 callback(info)
             except BaseException as exc:
                 active = False
-                _core.reschedule(task, outcome.Error(exc))
+                token.reschedule(outcome.Error(exc))
 
         self._completion_key_callbacks[key] = deliver
         try:
             task_status.started(key)
-            await _core.wait_task_rescheduled(abort)
+            await token
         finally:
             del self._completion_key_callbacks[key]
         raise AssertionError("Should never get here")

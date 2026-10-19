@@ -10,18 +10,18 @@ import attrs
 
 from .. import _core
 from ._io_common import wake_all
-from ._run import Task, _public
+from ._run import _public
+from ._wake_token import WakeToken
 from ._wakeup_socketpair import WakeupSocketpair
 
 if TYPE_CHECKING:
-    from .._core import Abort, RaiseCancelT
     from .._file_io import _HasFileNo
 
 
 @attrs.define(eq=False)
 class EpollWaiters:
-    read_task: Task | None = None
-    write_task: Task | None = None
+    read_waiter: WakeToken[None] | None = None
+    write_waiter: WakeToken[None] | None = None
     current_flags: int = 0
 
 
@@ -216,9 +216,9 @@ class EpollIOManager:
         tasks_waiting_read = 0
         tasks_waiting_write = 0
         for waiter in self._registered.values():
-            if waiter.read_task is not None:
+            if waiter.read_waiter is not None:
                 tasks_waiting_read += 1
-            if waiter.write_task is not None:
+            if waiter.write_waiter is not None:
                 tasks_waiting_write += 1
         return _EpollStatistics(
             tasks_waiting_read=tasks_waiting_read,
@@ -253,20 +253,25 @@ class EpollIOManager:
             # Clever hack stolen from selectors.EpollSelector: an event
             # with EPOLLHUP or EPOLLERR flags wakes both readers and
             # writers.
-            if flags & ~select.EPOLLIN and waiters.write_task is not None:
-                _core.reschedule(waiters.write_task)
-                waiters.write_task = None
-            if flags & ~select.EPOLLOUT and waiters.read_task is not None:
-                _core.reschedule(waiters.read_task)
-                waiters.read_task = None
+            if flags & ~select.EPOLLIN and waiters.write_waiter is not None:
+                waiters.write_waiter.reschedule()
+                waiters.write_waiter = None
+            if flags & ~select.EPOLLOUT and waiters.read_waiter is not None:
+                waiters.read_waiter.reschedule()
+                waiters.read_waiter = None
             self._update_registrations(fd)
 
-    def _update_registrations(self, fd: int) -> None:
+    def _update_registrations(
+        self,
+        fd: int,
+        *,
+        own: WakeToken[None] | None = None,
+    ) -> None:
         waiters = self._registered[fd]
         wanted_flags = 0
-        if waiters.read_task is not None:
+        if waiters.read_waiter is not None:
             wanted_flags |= select.EPOLLIN
-        if waiters.write_task is not None:
+        if waiters.write_waiter is not None:
             wanted_flags |= select.EPOLLOUT
         if wanted_flags != waiters.current_flags:
             try:
@@ -283,9 +288,9 @@ class EpollIOManager:
                 # want to try to unregister the fd, because that will probably
                 # fail too. Just clear our state and wake everyone up.
                 del self._registered[fd]
-                # This could raise (in case we're calling this inside one of
-                # the to-be-woken tasks), so we have to do it last.
-                wake_all(waiters, exc)
+                # This could raise (if the caller's own token is among the
+                # waiters, see _epoll_wait), so we have to do it last.
+                wake_all(waiters, exc, own=own)
                 return
         if not wanted_flags:
             del self._registered[fd]
@@ -298,15 +303,18 @@ class EpollIOManager:
             raise _core.BusyResourceError(
                 "another task is already reading / writing this fd",
             )
-        setattr(waiters, attr_name, _core.current_task())
-        self._update_registrations(fd)
 
-        def abort(_: RaiseCancelT) -> Abort:
+        def on_cancel(token: WakeToken[None]) -> None:
             setattr(waiters, attr_name, None)
             self._update_registrations(fd)
-            return _core.Abort.SUCCEEDED
+            token.reschedule_cancelled()
 
-        await _core.wait_task_rescheduled(abort)
+        token = WakeToken(on_cancel)
+        setattr(waiters, attr_name, token)
+        # If this fails (e.g. the fd is bad), it wakes up the other waiter, if
+        # any, and then raises here, since our token isn't awaited yet.
+        self._update_registrations(fd, own=token)
+        await token
 
     @_public
     async def wait_readable(self, fd: int | _HasFileNo) -> None:
@@ -331,7 +339,7 @@ class EpollIOManager:
             if another task calls :func:`notify_closing` while this
             function is still working.
         """
-        await self._epoll_wait(fd, "read_task")
+        await self._epoll_wait(fd, "read_waiter")
 
     @_public
     async def wait_writable(self, fd: int | _HasFileNo) -> None:
@@ -346,7 +354,7 @@ class EpollIOManager:
             if another task calls :func:`notify_closing` while this
             function is still working.
         """
-        await self._epoll_wait(fd, "write_task")
+        await self._epoll_wait(fd, "write_waiter")
 
     @_public
     def notify_closing(self, fd: int | _HasFileNo) -> None:

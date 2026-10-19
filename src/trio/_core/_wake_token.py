@@ -71,7 +71,10 @@ class WakeToken(Generic[T, D]):
             the cancellation itself.
 
           It's a plain attribute, so it can be replaced while the token is
-          outstanding.
+          outstanding. And if there's nothing to clean up,
+          :meth:`reschedule_cancelled` itself will do::
+
+              await WakeToken(WakeToken.reschedule_cancelled)
       data: Anything the code that puts the task to sleep wants to share
           with the code that wakes it up or cancels it. Trio never looks at
           it. It can only be left out when its type parameter is None, which

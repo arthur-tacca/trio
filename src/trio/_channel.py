@@ -17,7 +17,7 @@ from outcome import Error, Value
 import trio
 
 from ._abc import ReceiveChannel, ReceiveType, SendChannel, SendType, T
-from ._core import Abort, BrokenResourceError, RaiseCancelT, Task, enable_ki_protection
+from ._core import BrokenResourceError, WakeToken, enable_ki_protection
 from ._util import (
     MultipleExceptionError,
     NoPublicConstructor,
@@ -156,10 +156,14 @@ class MemoryChannelState(Generic[T]):
     # Counts of open endpoints using this state
     open_send_channels: int = 0
     open_receive_channels: int = 0
-    # {task: value}
-    send_tasks: OrderedDict[Task, T] = attrs.Factory(OrderedDict)
-    # {task: None}
-    receive_tasks: OrderedDict[Task, None] = attrs.Factory(OrderedDict)
+    # {token: value}, for the tasks blocked in send()
+    send_waiters: OrderedDict[WakeToken[None, MemorySendChannel[T]], T] = attrs.Factory(
+        OrderedDict
+    )
+    # {token: None}, for the tasks blocked in receive()
+    receive_waiters: OrderedDict[WakeToken[T, MemoryReceiveChannel[T]], None] = (
+        attrs.Factory(OrderedDict)
+    )
     # The largest len(self.data) has ever been
     peak_buffer_used: int = 0
 
@@ -169,10 +173,17 @@ class MemoryChannelState(Generic[T]):
             max_buffer_size=self.max_buffer_size,
             open_send_channels=self.open_send_channels,
             open_receive_channels=self.open_receive_channels,
-            tasks_waiting_send=len(self.send_tasks),
-            tasks_waiting_receive=len(self.receive_tasks),
+            tasks_waiting_send=len(self.send_waiters),
+            tasks_waiting_receive=len(self.receive_waiters),
             peak_buffer_used=self.peak_buffer_used,
         )
+
+
+def _cancel_send(token: WakeToken[None, MemorySendChannel[T]]) -> None:
+    channel = token.data
+    channel._waiters.remove(token)
+    del channel._state.send_waiters[token]
+    token.reschedule_cancelled()
 
 
 @final
@@ -186,10 +197,10 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
 
     _state: MemoryChannelState[SendType]
     _closed: bool = False
-    # This is just the tasks waiting on *this* object. As compared to
-    # self._state.send_tasks, which includes tasks from this object and
+    # This is just the waiters on *this* object. As compared to
+    # self._state.send_waiters, which includes waiters from this object and
     # all clones.
-    _tasks: set[Task] = attrs.Factory(set)
+    _waiters: set[WakeToken[None, MemorySendChannel[SendType]]] = attrs.Factory(set)
 
     def __attrs_post_init__(self) -> None:
         self._state.open_send_channels += 1
@@ -213,11 +224,11 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
             raise trio.ClosedResourceError
         if self._state.open_receive_channels == 0:
             raise trio.BrokenResourceError
-        if self._state.receive_tasks:
+        if self._state.receive_waiters:
             assert not self._state.data
-            task, _ = self._state.receive_tasks.popitem(last=False)
-            task.custom_sleep_data._tasks.remove(task)
-            trio.lowlevel.reschedule(task, Value(value))
+            token, _ = self._state.receive_waiters.popitem(last=False)
+            token.data._waiters.remove(token)
+            token.reschedule(Value(value))
         elif len(self._state.data) < self._state.max_buffer_size:
             self._state.data.append(value)
             self._state.peak_buffer_used = max(
@@ -243,17 +254,10 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
             await trio.lowlevel.cancel_shielded_checkpoint()
             return
 
-        task = trio.lowlevel.current_task()
-        self._tasks.add(task)
-        self._state.send_tasks[task] = value
-        task.custom_sleep_data = self
-
-        def abort_fn(_: RaiseCancelT) -> Abort:
-            self._tasks.remove(task)
-            del self._state.send_tasks[task]
-            return trio.lowlevel.Abort.SUCCEEDED
-
-        await trio.lowlevel.wait_task_rescheduled(abort_fn)
+        token = WakeToken(_cancel_send, self)
+        self._waiters.add(token)
+        self._state.send_waiters[token] = value
+        await token
 
     # Return type must be stringified or use a TypeVar
     @enable_ki_protection
@@ -312,17 +316,17 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         if self._closed:
             return
         self._closed = True
-        for task in self._tasks:
-            trio.lowlevel.reschedule(task, Error(trio.ClosedResourceError()))
-            del self._state.send_tasks[task]
-        self._tasks.clear()
+        for token in self._waiters:
+            token.reschedule(Error(trio.ClosedResourceError()))
+            del self._state.send_waiters[token]
+        self._waiters.clear()
         self._state.open_send_channels -= 1
         if self._state.open_send_channels == 0:
-            assert not self._state.send_tasks
-            for task in self._state.receive_tasks:
-                task.custom_sleep_data._tasks.remove(task)
-                trio.lowlevel.reschedule(task, Error(trio.EndOfChannel()))
-            self._state.receive_tasks.clear()
+            assert not self._state.send_waiters
+            for receive_token in self._state.receive_waiters:
+                receive_token.data._waiters.remove(receive_token)
+                receive_token.reschedule(Error(trio.EndOfChannel()))
+            self._state.receive_waiters.clear()
 
     @enable_ki_protection
     async def aclose(self) -> None:
@@ -331,6 +335,13 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         See `MemorySendChannel.close`."""
         self.close()
         await trio.lowlevel.checkpoint()
+
+
+def _cancel_receive(token: WakeToken[T, MemoryReceiveChannel[T]]) -> None:
+    channel = token.data
+    channel._waiters.remove(token)
+    del channel._state.receive_waiters[token]
+    token.reschedule_cancelled()
 
 
 @final
@@ -344,7 +355,10 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
 
     _state: MemoryChannelState[ReceiveType]
     _closed: bool = False
-    _tasks: set[trio._core._run.Task] = attrs.Factory(set)
+    # As for MemorySendChannel._waiters
+    _waiters: set[WakeToken[ReceiveType, MemoryReceiveChannel[ReceiveType]]] = (
+        attrs.Factory(set)
+    )
 
     def __attrs_post_init__(self) -> None:
         self._state.open_receive_channels += 1
@@ -367,10 +381,10 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         """
         if self._closed:
             raise trio.ClosedResourceError
-        if self._state.send_tasks:
-            task, value = self._state.send_tasks.popitem(last=False)
-            task.custom_sleep_data._tasks.remove(task)
-            trio.lowlevel.reschedule(task)
+        if self._state.send_waiters:
+            token, value = self._state.send_waiters.popitem(last=False)
+            token.data._waiters.remove(token)
+            token.reschedule()
             self._state.data.append(value)
             # Fall through
         if self._state.data:
@@ -397,19 +411,10 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
             await trio.lowlevel.cancel_shielded_checkpoint()
             return value
 
-        task = trio.lowlevel.current_task()
-        self._tasks.add(task)
-        self._state.receive_tasks[task] = None
-        task.custom_sleep_data = self
-
-        def abort_fn(_: RaiseCancelT) -> Abort:
-            self._tasks.remove(task)
-            del self._state.receive_tasks[task]
-            return trio.lowlevel.Abort.SUCCEEDED
-
-        # Not strictly guaranteed to return ReceiveType, but will do so unless
-        # you intentionally reschedule with a bad value.
-        return await trio.lowlevel.wait_task_rescheduled(abort_fn)  # type: ignore[no-any-return]
+        token = WakeToken(_cancel_receive, self)
+        self._waiters.add(token)
+        self._state.receive_waiters[token] = None
+        return await token
 
     @enable_ki_protection
     def clone(self) -> MemoryReceiveChannel[ReceiveType]:
@@ -470,17 +475,17 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         if self._closed:
             return
         self._closed = True
-        for task in self._tasks:
-            trio.lowlevel.reschedule(task, Error(trio.ClosedResourceError()))
-            del self._state.receive_tasks[task]
-        self._tasks.clear()
+        for token in self._waiters:
+            token.reschedule(Error(trio.ClosedResourceError()))
+            del self._state.receive_waiters[token]
+        self._waiters.clear()
         self._state.open_receive_channels -= 1
         if self._state.open_receive_channels == 0:
-            assert not self._state.receive_tasks
-            for task in self._state.send_tasks:
-                task.custom_sleep_data._tasks.remove(task)
-                trio.lowlevel.reschedule(task, Error(trio.BrokenResourceError()))
-            self._state.send_tasks.clear()
+            assert not self._state.receive_waiters
+            for send_token in self._state.send_waiters:
+                send_token.data._waiters.remove(send_token)
+                send_token.reschedule(Error(trio.BrokenResourceError()))
+            self._state.send_waiters.clear()
             self._state.data.clear()
 
     @enable_ki_protection

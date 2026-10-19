@@ -7,8 +7,7 @@ import attrs
 
 import trio
 
-from . import _core
-from ._core import Abort, RaiseCancelT, enable_ki_protection
+from ._core import WakeToken, enable_ki_protection
 from ._parking_lot import (
     ParkingLot,
     add_parking_lot_breaker,
@@ -35,6 +34,11 @@ class EventStatistics:
     """
 
     tasks_waiting: int
+
+
+def _cancel_event_wait(token: WakeToken[None, Event]) -> None:
+    token.data._waiters.remove(token)
+    token.reschedule_cancelled()
 
 
 @final
@@ -65,7 +69,7 @@ class Event:
 
     """
 
-    _tasks: set[Task] = attrs.field(factory=set, init=False)
+    _waiters: set[WakeToken[None, Event]] = attrs.field(factory=set, init=False)
     _flag: bool = attrs.field(default=False, init=False)
 
     def is_set(self) -> bool:
@@ -77,9 +81,9 @@ class Event:
         """Set the internal flag value to True, and wake any waiting tasks."""
         if not self._flag:
             self._flag = True
-            for task in self._tasks:
-                _core.reschedule(task)
-            self._tasks.clear()
+            for token in self._waiters:
+                token.reschedule()
+            self._waiters.clear()
 
     async def wait(self) -> None:
         """Block until the internal flag value becomes True.
@@ -90,14 +94,9 @@ class Event:
         if self._flag:
             await trio.lowlevel.checkpoint()
         else:
-            task = _core.current_task()
-            self._tasks.add(task)
-
-            def abort_fn(_: RaiseCancelT) -> Abort:
-                self._tasks.remove(task)
-                return _core.Abort.SUCCEEDED
-
-            await _core.wait_task_rescheduled(abort_fn)
+            token = WakeToken(_cancel_event_wait, self)
+            self._waiters.add(token)
+            await token
 
     def statistics(self) -> EventStatistics:
         """Return an object containing debugging information.
@@ -108,7 +107,7 @@ class Event:
           :meth:`wait` method.
 
         """
-        return EventStatistics(tasks_waiting=len(self._tasks))
+        return EventStatistics(tasks_waiting=len(self._waiters))
 
     def __bool__(self) -> Literal[True]:
         """Raise error."""

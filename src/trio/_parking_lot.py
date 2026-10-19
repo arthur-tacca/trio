@@ -77,6 +77,7 @@ import attrs
 import outcome
 
 from . import _core
+from ._core import WakeToken
 from ._util import final
 
 if TYPE_CHECKING:
@@ -126,6 +127,13 @@ class ParkingLotStatistics:
     tasks_waiting: int
 
 
+def _cancel_park(token: WakeToken[None, ParkingLot]) -> None:
+    # token.data is the lot the token is currently parked in: repark() moves
+    # tokens between lots, and updates it.
+    del token.data._parked[token]
+    token.reschedule_cancelled()
+
+
 @final
 @attrs.define(eq=False)
 class ParkingLot:
@@ -141,9 +149,12 @@ class ParkingLot:
 
     """
 
-    # {task: None}, we just want a deque where we can quickly delete random
+    # {token: None}, we just want a deque where we can quickly delete random
     # items
-    _parked: OrderedDict[Task, None] = attrs.field(factory=OrderedDict, init=False)
+    _parked: OrderedDict[WakeToken[None, ParkingLot], None] = attrs.field(
+        factory=OrderedDict,
+        init=False,
+    )
     broken_by: list[Task] = attrs.field(factory=list, init=False)
 
     def __len__(self) -> int:
@@ -172,17 +183,14 @@ class ParkingLot:
             raise _core.BrokenResourceError(
                 f"Attempted to park in parking lot broken by {self.broken_by}",
             )
-        task = _core.current_task()
-        self._parked[task] = None
-        task.custom_sleep_data = self
+        token = WakeToken(_cancel_park, self)
+        self._parked[token] = None
+        await token
 
-        def abort_fn(_: _core.RaiseCancelT) -> _core.Abort:
-            del task.custom_sleep_data._parked[task]
-            return _core.Abort.SUCCEEDED
-
-        await _core.wait_task_rescheduled(abort_fn)
-
-    def _pop_several(self, count: int | float) -> Iterator[Task]:  # noqa: PYI041
+    def _pop_several(
+        self,
+        count: int | float,  # noqa: PYI041
+    ) -> Iterator[WakeToken[None, ParkingLot]]:
         if isinstance(count, float):
             if math.isinf(count):
                 count = len(self._parked)
@@ -191,8 +199,8 @@ class ParkingLot:
         else:
             count = min(count, len(self._parked))
         for _ in range(count):
-            task, _ = self._parked.popitem(last=False)
-            yield task
+            token, _ = self._parked.popitem(last=False)
+            yield token
 
     @_core.enable_ki_protection
     def unpark(self, *, count: int | float = 1) -> list[Task]:  # noqa: PYI041
@@ -206,10 +214,10 @@ class ParkingLot:
           count (int | math.inf): the number of tasks to unpark.
 
         """
-        tasks = list(self._pop_several(count))
-        for task in tasks:
-            _core.reschedule(task)
-        return tasks
+        tokens = list(self._pop_several(count))
+        for token in tokens:
+            token.reschedule()
+        return [token.task for token in tokens]
 
     def unpark_all(self) -> list[Task]:
         """Unpark all parked tasks."""
@@ -256,9 +264,9 @@ class ParkingLot:
         """
         if not isinstance(new_lot, ParkingLot):
             raise TypeError("new_lot must be a ParkingLot")
-        for task in self._pop_several(count):
-            new_lot._parked[task] = None
-            task.custom_sleep_data = new_lot
+        for token in self._pop_several(count):
+            new_lot._parked[token] = None
+            token.data = new_lot
 
     def repark_all(self, new_lot: ParkingLot) -> None:
         """Move all parked tasks from one :class:`ParkingLot` object to
@@ -289,9 +297,8 @@ class ParkingLot:
 
         self.broken_by.append(task)
 
-        for parked_task in self._parked:
-            _core.reschedule(
-                parked_task,
+        for token in self._parked:
+            token.reschedule(
                 outcome.Error(
                     _core.BrokenResourceError(f"Parking lot broken by {task}"),
                 ),

@@ -134,7 +134,9 @@ def register_with_iocp(handle: int | CData) -> None:
 
 
 @enable_ki_protection
-async def wait_overlapped(handle_: int | CData, lpOverlapped: CData | int) -> object:
+async def wait_overlapped(
+    handle_: int | CData, lpOverlapped: CData | int
+) -> CompletionKeyEventInfo:
     """TODO: these are implemented, but are currently more of a sketch than
     anything real. See `#26
     <https://github.com/python-trio/trio/issues/26>`__ and `#52

@@ -10,12 +10,13 @@ import outcome
 
 from .. import _core
 from ._run import TASK_STATUS_IGNORED, _public
+from ._wake_token import WakeToken
 from ._wakeup_socketpair import WakeupSocketpair
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from .._core import Abort, RaiseCancelT, Task, TaskStatus
+    from .._core import TaskStatus
     from .._file_io import _HasFileNo
 
 assert not TYPE_CHECKING or (sys.platform != "linux" and sys.platform != "win32")
@@ -33,10 +34,12 @@ class _KqueueStatistics:
 @attrs.define(eq=False)
 class KqueueIOManager:
     _kqueue: select.kqueue = attrs.Factory(select.kqueue)
-    # {(ident, filter): Task, or a monitor_kevent callback}
-    _registered: dict[tuple[int, int], Task | Callable[[select.kevent], object]] = (
-        attrs.Factory(dict)
-    )
+    # {(ident, filter): the WakeToken of a task blocked in wait_kevent, or a
+    # monitor_kevent callback}
+    _registered: dict[
+        tuple[int, int],
+        WakeToken[select.kevent] | Callable[[select.kevent], object],
+    ] = attrs.Factory(dict)
     # Keeps track of whether we are running host callbacks in guest mode
     # and, if so, which events have been discarded by those callbacks
     # cancelling waiters or calling notify_closing. Needed in case they
@@ -60,7 +63,7 @@ class KqueueIOManager:
         tasks_waiting = 0
         monitors = 0
         for receiver in self._registered.values():
-            if type(receiver) is _core.Task:
+            if isinstance(receiver, WakeToken):
                 tasks_waiting += 1
             else:
                 monitors += 1
@@ -111,10 +114,10 @@ class KqueueIOManager:
                 # key would be a bug, so let the lookup below fail loudly.
                 continue
             receiver = self._registered[key]
-            if isinstance(receiver, _core.Task):
+            if isinstance(receiver, WakeToken):
                 # A task can only be woken once, so it's done with this key.
                 del self._registered[key]
-                _core.reschedule(receiver, outcome.Value(event))
+                receiver.reschedule(outcome.Value(event))
             else:
                 # A monitor stays registered until monitor_kevent() returns.
                 receiver(event)
@@ -166,13 +169,14 @@ class KqueueIOManager:
             raise _core.BusyResourceError(
                 "attempt to register multiple listeners for same ident/filter pair",
             )
-        task = _core.current_task()
         active = True
 
-        def abort(_: RaiseCancelT) -> Abort:
+        def on_cancel(token: WakeToken[None]) -> None:
             nonlocal active
             active = False
-            return _core.Abort.SUCCEEDED
+            token.reschedule_cancelled()
+
+        token = WakeToken(on_cancel)
 
         def deliver(event: select.kevent) -> None:
             nonlocal active
@@ -184,12 +188,12 @@ class KqueueIOManager:
                 callback(event)
             except BaseException as exc:
                 active = False
-                _core.reschedule(task, outcome.Error(exc))
+                token.reschedule(outcome.Error(exc))
 
         self._registered[key] = deliver
         try:
             task_status.started()
-            await _core.wait_task_rescheduled(abort)
+            await token
         finally:
             del self._registered[key]
         raise AssertionError("Should never get here")
@@ -239,18 +243,7 @@ class KqueueIOManager:
                 "attempt to register multiple listeners for same ident/filter pair",
             )
 
-        # Register the event before updating _registered in case this throws
-        event = select.kevent(
-            ident,
-            filter,
-            select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-            fflags,
-            data,
-        )
-        self._kqueue.control([event], 0)
-        self._registered[key] = _core.current_task()
-
-        def abort(raise_cancel: RaiseCancelT) -> Abort:
+        def on_cancel(token: WakeToken[select.kevent]) -> None:
             self._deregister(key)
             try:
                 event = select.kevent(ident, filter, select.KQ_EV_DELETE)
@@ -276,9 +269,20 @@ class KqueueIOManager:
                 else:  # pragma: no cover
                     # As far as we know, this branch can't happen.
                     raise
-            return _core.Abort.SUCCEEDED
+            token.reschedule_cancelled()
 
-        return await _core.wait_task_rescheduled(abort)  # type: ignore[no-any-return]
+        # Register the event before updating _registered in case this throws
+        event = select.kevent(
+            ident,
+            filter,
+            select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags,
+            data,
+        )
+        self._kqueue.control([event], 0)
+        token: WakeToken[select.kevent] = WakeToken(on_cancel)
+        self._registered[key] = token
+        return await token
 
     @_public
     async def wait_readable(self, fd: int | _HasFileNo) -> None:
@@ -356,7 +360,7 @@ class KqueueIOManager:
             if receiver is None:
                 continue
 
-            if type(receiver) is _core.Task:
+            if isinstance(receiver, WakeToken):
                 event = select.kevent(fd, filter_, select.KQ_EV_DELETE)
                 try:
                     self._kqueue.control([event], 0)
@@ -369,7 +373,7 @@ class KqueueIOManager:
                     if e.errno not in (errno.EBADF, errno.ENOENT):
                         raise  # pragma: no cover
                 exc = _core.ClosedResourceError("another task closed this fd")
-                _core.reschedule(receiver, outcome.Error(exc))
+                receiver.reschedule(outcome.Error(exc))
                 self._deregister(key)
             else:
                 # XX this is an interesting example of a case where being able

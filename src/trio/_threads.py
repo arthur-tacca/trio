@@ -6,7 +6,7 @@ import inspect
 import queue as stdlib_queue
 import threading
 from itertools import count
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 import attrs
 import outcome
@@ -18,6 +18,7 @@ import trio
 from ._core import (
     RunVar,
     TrioToken,
+    WakeToken,
     checkpoint,
     disable_ki_protection,
     enable_ki_protection,
@@ -31,8 +32,6 @@ if TYPE_CHECKING:
 
     from typing_extensions import TypeVarTuple, Unpack
 
-    from trio._core._traps import RaiseCancelT
-
     Ts = TypeVarTuple("Ts")
 
 RetT = TypeVar("RetT")
@@ -44,8 +43,10 @@ class _ParentTaskData(threading.local):
 
     token: TrioToken
     abandon_on_cancel: bool
-    cancel_register: list[RaiseCancelT | None]
-    task_register: list[trio.lowlevel.Task | None]
+    # The registers are shared with the task running to_thread.run_sync; see
+    # there.
+    cancel_register: list[trio.Cancelled | None]
+    token_register: list[WakeToken[object] | None]
 
 
 PARENT_TASK_DATA = _ParentTaskData()
@@ -182,17 +183,17 @@ class Run(Generic[RetT]):  # type: ignore[explicit-any]
         result = await outcome.acapture(self.unprotected_afn)
         self.queue.put_nowait(result)
 
-    def run_in_host_task(self, token: TrioToken) -> None:
-        task_register = PARENT_TASK_DATA.task_register
+    def run_in_host_task(self, trio_token: TrioToken) -> None:
+        token_register = PARENT_TASK_DATA.token_register
 
         def in_trio_thread() -> None:
-            task = task_register[0]
-            assert task is not None, "guaranteed by abandon_on_cancel semantics"
-            trio.lowlevel.reschedule(task, outcome.Value(self))
+            token = token_register[0]
+            assert token is not None, "guaranteed by abandon_on_cancel semantics"
+            token.reschedule(outcome.Value(self))
 
-        token.run_sync_soon(in_trio_thread)
+        trio_token.run_sync_soon(in_trio_thread)
 
-    def run_in_system_nursery(self, token: TrioToken) -> None:
+    def run_in_system_nursery(self, trio_token: TrioToken) -> None:
         def in_trio_thread() -> None:
             try:
                 trio.lowlevel.spawn_system_task(
@@ -205,7 +206,7 @@ class Run(Generic[RetT]):  # type: ignore[explicit-any]
                     outcome.Error(trio.RunFinishedError("system nursery is closed")),
                 )
 
-        token.run_sync_soon(in_trio_thread)
+        trio_token.run_sync_soon(in_trio_thread)
 
 
 @attrs.frozen(eq=False, slots=False)
@@ -239,18 +240,18 @@ class RunSync(Generic[RetT]):  # type: ignore[explicit-any]
         result = outcome.capture(self.unprotected_fn)
         self.queue.put_nowait(result)
 
-    def run_in_host_task(self, token: TrioToken) -> None:
-        task_register = PARENT_TASK_DATA.task_register
+    def run_in_host_task(self, trio_token: TrioToken) -> None:
+        token_register = PARENT_TASK_DATA.token_register
 
         def in_trio_thread() -> None:
-            task = task_register[0]
-            assert task is not None, "guaranteed by abandon_on_cancel semantics"
-            trio.lowlevel.reschedule(task, outcome.Value(self))
+            token = token_register[0]
+            assert token is not None, "guaranteed by abandon_on_cancel semantics"
+            token.reschedule(outcome.Value(self))
 
-        token.run_sync_soon(in_trio_thread)
+        trio_token.run_sync_soon(in_trio_thread)
 
-    def run_in_system_nursery(self, token: TrioToken) -> None:
-        token.run_sync_soon(self.run_sync)
+    def run_in_system_nursery(self, trio_token: TrioToken) -> None:
+        trio_token.run_sync_soon(self.run_sync)
 
 
 @enable_ki_protection
@@ -351,13 +352,15 @@ async def to_thread_run_sync(
     if limiter is None:
         limiter = current_default_thread_limiter()
 
-    # Holds a reference to the task that's blocked in this function waiting
-    # for the result – or None if this function was cancelled and we should
-    # discard the result.
-    task_register: list[trio.lowlevel.Task | None] = [trio.lowlevel.current_task()]
-    # Holds a reference to the raise_cancel function provided if a cancellation
-    # is attempted against this task - or None if no such delivery has happened.
-    cancel_register: list[RaiseCancelT | None] = [None]
+    # Holds the WakeToken that this task is currently blocked on, waiting for
+    # the thread's result or its next from_thread.run* request – or None if
+    # it isn't blocked right now, or if this function was cancelled and we
+    # should discard the result.
+    token_register: list[WakeToken[object] | None] = [None]
+    # Holds the Cancelled exception to raise in from_thread.check_cancelled()
+    # once a cancellation has been delivered to this task - or None if no such
+    # delivery has happened.
+    cancel_register: list[trio.Cancelled | None] = [None]
     name = f"trio.to_thread.run_sync-{next(_thread_counter)}"
     placeholder = ThreadPlaceholder(name)
 
@@ -375,8 +378,9 @@ async def to_thread_run_sync(
                 limiter.release_on_behalf_of(placeholder)
 
         result = outcome.capture(do_release_then_return_result)
-        if task_register[0] is not None:
-            trio.lowlevel.reschedule(task_register[0], outcome.Value(result))
+        token = token_register[0]
+        if token is not None:
+            token.reschedule(outcome.Value(result))
 
     current_trio_token = trio.lowlevel.current_trio_token()
 
@@ -387,7 +391,7 @@ async def to_thread_run_sync(
         PARENT_TASK_DATA.token = current_trio_token
         PARENT_TASK_DATA.abandon_on_cancel = abandon_bool
         PARENT_TASK_DATA.cancel_register = cancel_register
-        PARENT_TASK_DATA.task_register = task_register
+        PARENT_TASK_DATA.token_register = token_register
         try:
             ret = context.run(sync_fn, *args)
 
@@ -404,7 +408,11 @@ async def to_thread_run_sync(
             del PARENT_TASK_DATA.token
             del PARENT_TASK_DATA.abandon_on_cancel
             del PARENT_TASK_DATA.cancel_register
-            del PARENT_TASK_DATA.task_register
+            del PARENT_TASK_DATA.token_register
+            # If the Cancelled in the register was raised in this thread, its
+            # traceback leads (via the frames' f_back chain) to this frame, and
+            # so to the register: drop it, so that's not a reference cycle.
+            cancel_register[0] = None
 
     context = contextvars.copy_context()
     # Trio doesn't use current_async_library_cvar, but if someone
@@ -428,25 +436,25 @@ async def to_thread_run_sync(
             limiter.release_on_behalf_of(placeholder)
             raise
 
-        def abort(raise_cancel: RaiseCancelT) -> trio.lowlevel.Abort:
+        def on_cancel(token: WakeToken[object]) -> None:
             # fill so from_thread_check_cancelled can raise
-            # 'raise_cancel' will immediately delete its reason object, so we make
-            # a copy in each thread
-            cancel_register[0] = raise_cancel
+            cancel_register[0] = token.get_cancelled_exception()
             if abandon_bool:
                 # empty so report_back_in_trio_thread_fn cannot reschedule
-                task_register[0] = None
-                return trio.lowlevel.Abort.SUCCEEDED
-            else:
-                return trio.lowlevel.Abort.FAILED
+                token_register[0] = None
+                token.reschedule_cancelled()
+            # Otherwise, we decline: the thread's result (or its next request)
+            # wakes us up as usual.
 
         while True:
-            # wait_task_rescheduled return value cannot be typed
-            msg_from_thread: outcome.Outcome[RetT] | Run[object] | RunSync[object] = (
-                await trio.lowlevel.wait_task_rescheduled(abort)
-            )
+            # The token's type is 'object' because the register it's shared
+            # through can't be typed with our RetT; see the isinstance checks.
+            token: WakeToken[object] = WakeToken(on_cancel)
+            token_register[0] = token
+            msg_from_thread = await token
+            token_register[0] = None
             if isinstance(msg_from_thread, outcome.Outcome):
-                return msg_from_thread.unwrap()
+                return cast("outcome.Outcome[RetT]", msg_from_thread).unwrap()
             elif isinstance(msg_from_thread, Run):
                 await msg_from_thread.run()
             elif isinstance(msg_from_thread, RunSync):
@@ -486,13 +494,21 @@ def from_thread_check_cancelled() -> None:
        for completeness.
     """
     try:
-        raise_cancel = PARENT_TASK_DATA.cancel_register[0]
+        exc = PARENT_TASK_DATA.cancel_register[0]
     except AttributeError:
         raise RuntimeError(
             "this thread wasn't created by Trio, can't check for cancellation",
         ) from None
-    if raise_cancel is not None:
-        raise_cancel()
+    if exc is not None:
+        try:
+            # It's the same exception object each time, so start its
+            # traceback afresh.
+            raise exc.with_traceback(None)
+        finally:
+            # This frame lives on in that traceback, so don't let it refer
+            # back to the exception: that would be a reference cycle. (Same
+            # trick as concurrent.futures.Future.result().)
+            del exc
 
 
 def _send_message_to_trio(
