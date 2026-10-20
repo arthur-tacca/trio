@@ -217,10 +217,6 @@ async def test_interrupted_by_close(
         notify_closing(a)
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Windows backend can't notify_closing an already-closed socket",
-)
 async def test_interrupted_by_close_before_notify(socketpair: SocketPair) -> None:
     # Like test_interrupted_by_close, but in the alternate order the
     # notify_closing docs allow: close first, then notify_closing, with no
@@ -522,7 +518,7 @@ async def test_can_survive_unnotified_close() -> None:
     # Acceptable behaviors:
     # - wait_* never return, but can be cancelled cleanly
     # - wait_* exit cleanly
-    # - wait_* raise an OSError
+    # - wait_* raise an OSError or ClosedResourceError
     #
     # Not acceptable:
     # - getting stuck in an uncancellable state
@@ -536,7 +532,7 @@ async def test_can_survive_unnotified_close() -> None:
         *args: ArgsT.args,
         **kwargs: ArgsT.kwargs,
     ) -> None:
-        with suppress(OSError):
+        with suppress(OSError, _core.ClosedResourceError):
             await async_func(*args, **kwargs)
 
     with stdlib_socket.socket() as s:

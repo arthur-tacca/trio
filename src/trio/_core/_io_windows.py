@@ -208,7 +208,9 @@ class CKeys(enum.IntEnum):
 # However, we can't avoid getting LOCAL_CLOSE notifications -- the kernel
 # delivers them whether we ask for them or not -- so better to include them
 # here for documentation, and so that when we check (delivered & requested) we
-# get a match.
+# get a match. When one does arrive, process_events wakes the waiters with
+# ClosedResourceError, as notify_closing would have: nothing can succeed on
+# the socket any more.
 
 READABLE_FLAGS = (
     AFDPollFlags.AFD_POLL_RECEIVE
@@ -587,12 +589,24 @@ class WindowsIOManager:
                         code = ntdll.RtlNtStatusToDosError(lpo.Internal)
                         raise_winerror(code)
                     flags = op.poll_info.Handles[0].Events
-                    if waiters.read_waiter and flags & READABLE_FLAGS:
-                        waiters.read_waiter.reschedule()
-                        waiters.read_waiter = None
-                    if waiters.write_waiter and flags & WRITABLE_FLAGS:
-                        waiters.write_waiter.reschedule()
-                        waiters.write_waiter = None
+                    if flags & AFDPollFlags.AFD_POLL_LOCAL_CLOSE:
+                        # The socket object was closed without a
+                        # notify_closing() first. (Only its last handle
+                        # reports this; a dup'ed socket's waiters are stuck
+                        # until cancelled, see the note on READABLE_FLAGS.)
+                        wake_all(
+                            waiters,
+                            _core.ClosedResourceError(
+                                "another task closed this resource",
+                            ),
+                        )
+                    else:
+                        if waiters.read_waiter and flags & READABLE_FLAGS:
+                            waiters.read_waiter.reschedule()
+                            waiters.read_waiter = None
+                        if waiters.write_waiter and flags & WRITABLE_FLAGS:
+                            waiters.write_waiter.reschedule()
+                            waiters.write_waiter = None
                     self._refresh_afd(op.poll_info.Handles[0].Handle)
             elif entry.lpCompletionKey == CKeys.WAIT_OVERLAPPED:
                 # Regular I/O event, dispatch on lpOverlapped
@@ -864,9 +878,20 @@ class WindowsIOManager:
         convenient, *but only if* you make sure not to have any checkpoints in
         between the steps. This way they all happen in a single atomic
         step, so other tasks won't be able to tell what order they happened
-        in anyway.
+        in anyway. (On Windows there's one more condition for closing first:
+        the socket must not have been duplicated, since closing one of
+        several handles to it doesn't wake the waiters.)
         """
-        handle = _get_base_socket(handle)
+        try:
+            handle = _get_base_socket(handle)
+        except OSError as exc:
+            if exc.winerror != ErrorCodes.ERROR_NOT_SOCKET:
+                raise
+            # The socket is already closed (or never was one), so there's
+            # nothing to look the waiters up by. If that was its last handle,
+            # the kernel reports AFD_POLL_LOCAL_CLOSE to the pending poll and
+            # process_events wakes them with ClosedResourceError from that.
+            return
         waiters = self._afd_waiters.get(handle)
         if waiters is not None:
             wake_all(waiters, _core.ClosedResourceError())

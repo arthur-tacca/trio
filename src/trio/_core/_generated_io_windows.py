@@ -112,7 +112,9 @@ def notify_closing(handle: Handle | int | _HasFileNo) -> None:
     convenient, *but only if* you make sure not to have any checkpoints in
     between the steps. This way they all happen in a single atomic
     step, so other tasks won't be able to tell what order they happened
-    in anyway.
+    in anyway. (On Windows there's one more condition for closing first:
+    the socket must not have been duplicated, since closing one of
+    several handles to it doesn't wake the waiters.)
     """
     try:
         return GLOBAL_RUN_CONTEXT.runner.io_manager.notify_closing(handle)
