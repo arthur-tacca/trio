@@ -10,12 +10,11 @@ import attrs
 import outcome
 
 from .. import _core
-from .._deprecate import warn_deprecated
 from ._run import _public
 from ._wakeup_socketpair import WakeupSocketpair
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Iterator
 
     from .._core import Abort, RaiseCancelT, Task, UnboundedQueue
     from .._file_io import _HasFileNo
@@ -166,7 +165,6 @@ class KqueueIOManager:
         self,
         ident: int | _HasFileNo,
         filter: int,
-        abort_func: Callable[[RaiseCancelT], Abort] | None = None,
         *,
         fflags: int = 0,
         data: int = 0,
@@ -201,33 +199,10 @@ class KqueueIOManager:
         if not isinstance(ident, int):
             ident = ident.fileno()
 
-        if abort_func is not None:
-            warn_deprecated(
-                "wait_kevent(..., abort_func=...)",
-                "0.35.0",
-                issue=578,
-                instead="wait_kevent(ident, filter, fflags=..., data=...),"
-                " which registers the kevent itself",
-            )
-
         key = (ident, filter)
         if key in self._registered:
             raise _core.BusyResourceError(
                 "attempt to register multiple listeners for same ident/filter pair",
-            )
-
-        if abort_func is not None:
-            abort_fn = abort_func
-            self._registered[key] = _core.current_task()
-
-            def abort_deprecated(raise_cancel: RaiseCancelT) -> Abort:
-                r = abort_fn(raise_cancel)
-                if r is _core.Abort.SUCCEEDED:  # TODO: test this branch
-                    self._deregister(key)
-                return r
-
-            return await _core.wait_task_rescheduled(  # type: ignore[no-any-return]
-                abort_deprecated,
             )
 
         # Register the event before updating _registered in case this throws

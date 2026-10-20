@@ -1,0 +1,3 @@
+The old form of `trio.lowlevel.wait_kevent`, which took an ``abort_func``
+callback and required the caller to register the kevent with the kqueue
+itself (and to unregister it in the callback), has been removed.

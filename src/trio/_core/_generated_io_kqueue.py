@@ -11,12 +11,10 @@ from ._run import GLOBAL_RUN_CONTEXT
 
 if TYPE_CHECKING:
     import select
-    from collections.abc import Callable
     from contextlib import AbstractContextManager
 
     from .. import _core
     from .._file_io import _HasFileNo
-    from ._traps import Abort, RaiseCancelT
 
 assert not TYPE_CHECKING or sys.platform == "darwin"
 
@@ -59,12 +57,7 @@ def monitor_kevent(
 
 @enable_ki_protection
 async def wait_kevent(
-    ident: int | _HasFileNo,
-    filter: int,
-    abort_func: Callable[[RaiseCancelT], Abort] | None = None,
-    *,
-    fflags: int = 0,
-    data: int = 0,
+    ident: int | _HasFileNo, filter: int, *, fflags: int = 0, data: int = 0
 ) -> select.kevent:
     """Waits for a one-shot kevent to happen.
 
@@ -95,7 +88,7 @@ async def wait_kevent(
     """
     try:
         return await GLOBAL_RUN_CONTEXT.runner.io_manager.wait_kevent(
-            ident, filter, abort_func, fflags=fflags, data=data
+            ident, filter, fflags=fflags, data=data
         )
     except AttributeError:
         raise RuntimeError("must be called from async context") from None
