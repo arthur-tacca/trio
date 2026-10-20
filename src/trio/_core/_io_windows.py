@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypeAlias, TypeVa
 
 import attrs
 import outcome
-from outcome import Value
+from outcome import Error, Value
 
 from .. import _core
 from ._io_common import wake_all
@@ -260,6 +260,13 @@ class _AFDPollInfo(Protocol):
     Handles: list[_AFDHandle]
 
 
+# Just used for internal type checking: an OVERLAPPED_ENTRY.
+class _OverlappedEntry(Protocol):
+    lpCompletionKey: int
+    lpOverlapped: CData
+    dwNumberOfBytesTransferred: int
+
+
 # We also need to bundle up all the info for a single op into a standalone
 # object, because we need to keep all these objects alive until the operation
 # finishes, even if we're throwing it away.
@@ -445,8 +452,13 @@ class WindowsIOManager:
         # {socket handle: AFDWaiters}
         self._afd_waiters: dict[Handle, AFDWaiters] = {}
 
-        # {lpOverlapped: the WakeToken of the task blocked in wait_overlapped}
-        self._overlapped_waiters: dict[CData, WakeToken[CompletionKeyEventInfo]] = {}
+        # {lpOverlapped: the WakeToken of the task blocked in wait_overlapped}.
+        # The token's data records whether we've asked Windows to cancel the
+        # I/O, which decides what the task is woken with (see
+        # _complete_overlapped).
+        self._overlapped_waiters: dict[
+            CData, WakeToken[CompletionKeyEventInfo, bool]
+        ] = {}
         self._posted_too_late_to_cancel: set[CData] = set()
 
         self._completion_key_callbacks: dict[
@@ -585,13 +597,7 @@ class WindowsIOManager:
             elif entry.lpCompletionKey == CKeys.WAIT_OVERLAPPED:
                 # Regular I/O event, dispatch on lpOverlapped
                 waiter = self._overlapped_waiters.pop(entry.lpOverlapped)
-                overlapped = entry.lpOverlapped
-                transferred = entry.dwNumberOfBytesTransferred
-                info = CompletionKeyEventInfo(
-                    lpOverlapped=overlapped,
-                    dwNumberOfBytesTransferred=transferred,
-                )
-                waiter.reschedule(Value(info))
+                self._complete_overlapped(waiter, entry)
             elif entry.lpCompletionKey == CKeys.LATE_CANCEL:
                 # Post made by a regular I/O event's on_cancel
                 # after it failed to cancel the I/O. If we still
@@ -638,6 +644,38 @@ class WindowsIOManager:
                     dwNumberOfBytesTransferred=transferred,
                 )
                 callback(info)
+
+    def _complete_overlapped(
+        self,
+        waiter: WakeToken[CompletionKeyEventInfo, bool],
+        entry: _OverlappedEntry,
+    ) -> None:
+        # Wake the task blocked in wait_overlapped with the result of its I/O,
+        # as reported by the completion entry.
+        lpOverlapped = cast("_Overlapped", entry.lpOverlapped)
+        if lpOverlapped.Internal == 0:
+            info = CompletionKeyEventInfo(
+                lpOverlapped=entry.lpOverlapped,
+                dwNumberOfBytesTransferred=entry.dwNumberOfBytesTransferred,
+            )
+            waiter.reschedule(Value(info))
+            return
+        # The lpOverlapped reports the error as an NT status code, which we
+        # must convert back to a Win32 error code before it will produce the
+        # right sorts of exceptions.
+        code = ntdll.RtlNtStatusToDosError(lpOverlapped.Internal)
+        if code != ErrorCodes.ERROR_OPERATION_ABORTED:
+            waiter.reschedule(outcome.capture(raise_winerror, code))
+        elif waiter.data:
+            # The CancelIoEx in wait_overlapped's on_cancel took effect.
+            waiter.reschedule_cancelled()
+        else:
+            # We didn't request this cancellation, so assume it happened due
+            # to the underlying handle being closed before the operation
+            # could complete.
+            waiter.reschedule(
+                Error(_core.ClosedResourceError("another task closed this resource")),
+            )
 
     def _register_with_iocp(self, handle_: int | CData, completion_key: int) -> None:
         handle = _handle(handle_)
@@ -865,11 +903,12 @@ class WindowsIOManager:
             raise _core.BusyResourceError(
                 "another task is already waiting on that lpOverlapped",
             )
-        cancel_requested = False
 
-        def on_cancel(token: WakeToken[CompletionKeyEventInfo]) -> None:
-            nonlocal cancel_requested
-            cancel_requested = True
+        def on_cancel(token: WakeToken[CompletionKeyEventInfo, bool]) -> None:
+            # Record that we asked for the cancellation, so that
+            # _complete_overlapped can tell it apart from the handle being
+            # closed under us.
+            token.data = True
             try:
                 _check(kernel32.CancelIoEx(handle, lpOverlapped))
             except OSError as exc:
@@ -904,29 +943,13 @@ class WindowsIOManager:
                     raise _core.TrioInternalError(
                         "CancelIoEx failed with unexpected error",
                     ) from exc
-            # Either way, the cancellation isn't delivered here: the I/O's
-            # completion wakes us up as usual, and we deal with it below.
+            # Either way, the cancellation isn't delivered here: we stay
+            # blocked until the I/O's completion arrives, and
+            # _complete_overlapped decides what we're woken with.
 
-        token: WakeToken[CompletionKeyEventInfo] = WakeToken(on_cancel)
+        token = WakeToken(on_cancel, False)
         self._overlapped_waiters[lpOverlapped] = token
-        info = await token
-        lpOverlappedTyped = cast("_Overlapped", lpOverlapped)
-        if lpOverlappedTyped.Internal != 0:
-            # the lpOverlapped reports the error as an NT status code,
-            # which we must convert back to a Win32 error code before
-            # it will produce the right sorts of exceptions
-            code = ntdll.RtlNtStatusToDosError(lpOverlappedTyped.Internal)
-            if code == ErrorCodes.ERROR_OPERATION_ABORTED:
-                if cancel_requested:
-                    raise token.get_cancelled_exception()
-                else:
-                    # We didn't request this cancellation, so assume
-                    # it happened due to the underlying handle being
-                    # closed before the operation could complete.
-                    raise _core.ClosedResourceError("another task closed this resource")
-            else:
-                raise_winerror(code)
-        return info
+        return await token
 
     async def _perform_overlapped(
         self,
