@@ -57,33 +57,33 @@ class WakeToken(Generic[T, D]):
     task.
 
     Args:
-      abort_func: Called with the token as its only argument if a
+      on_cancel: Called with the token as its only argument if a
           cancellation needs to be delivered while the token is being
           awaited. It should clean up whatever state refers to the token,
           and then either:
 
-          * call :meth:`reschedule_aborted` (now or later) to deliver the
+          * call :meth:`reschedule_cancelled` (now or later) to deliver the
             cancellation, or
 
           * do nothing, in which case the token must still be rescheduled by
             "someone" as normal, and the awaiting task can call
-            :meth:`get_abort_exception` afterwards if it wants to raise the
-            cancellation itself.
+            :meth:`get_cancelled_exception` afterwards if it wants to raise
+            the cancellation itself.
 
           It's a plain attribute, so it can be replaced while the token is
           outstanding.
       data: Anything the code that puts the task to sleep wants to share
-          with the code that wakes it up or aborts it. Trio never looks at
+          with the code that wakes it up or cancels it. Trio never looks at
           it. It can only be left out when its type parameter is None, which
-          is the default: ``WakeToken(abort)`` is a ``WakeToken[T, None]``
-          with ``data`` None, and ``WakeToken(abort, lot)`` is a
+          is the default: ``WakeToken(on_cancel)`` is a ``WakeToken[T, None]``
+          with ``data`` None, and ``WakeToken(on_cancel, lot)`` is a
           ``WakeToken[T, Lot]``.
 
     The :exc:`~trio.Cancelled` to deliver is created on demand by
-    :meth:`get_abort_exception`, which can be called any number of times
-    once ``abort_func`` has been called. If ``abort_func`` declines to
-    abort, nothing is lost: the task is still cancelled, and will see that
-    at its next checkpoint.
+    :meth:`get_cancelled_exception`, which can be called any number of times
+    once ``on_cancel`` has been called. If ``on_cancel`` declines to
+    deliver it, nothing is lost: the task is still cancelled, and will see
+    that at its next checkpoint.
 
     Example, a minimal event::
 
@@ -103,23 +103,23 @@ class WakeToken(Generic[T, D]):
                     await trio.lowlevel.checkpoint()
                     return
 
-                def abort(token):
+                def on_cancel(token):
                     token.data._waiting.remove(token)
-                    token.reschedule_aborted()
+                    token.reschedule_cancelled()
 
-                token = trio.lowlevel.WakeToken(abort, self)
+                token = trio.lowlevel.WakeToken(on_cancel, self)
                 self._waiting.add(token)
                 await token
 
     """
 
-    abort_func: Callable[[WakeToken[T, D]], None]
+    on_cancel: Callable[[WakeToken[T, D]], None]
     data: D
     # The task awaiting us, or None until __await__ is called.
     _task: Task | None = attrs.field(init=False)
-    # None until Trio asks us to abort; then the raise_cancel callback,
-    # saved so that get_abort_exception() can produce the exception on
-    # demand.
+    # None until a cancellation is requested; then the raise_cancel
+    # callback, saved so that get_cancelled_exception() can produce the
+    # exception on demand.
     _raise_cancel: RaiseCancelT | None = attrs.field(init=False)
     _rescheduled: bool = attrs.field(init=False)
 
@@ -128,20 +128,20 @@ class WakeToken(Generic[T, D]):
     @overload
     def __init__(
         self: WakeToken[T1, None],
-        abort_func: Callable[[WakeToken[T1, None]], None],
+        on_cancel: Callable[[WakeToken[T1, None]], None],
     ) -> None: ...
     @overload
     def __init__(
         self,
-        abort_func: Callable[[WakeToken[T, D]], None],
+        on_cancel: Callable[[WakeToken[T, D]], None],
         data: D,
     ) -> None: ...
     def __init__(  # type: ignore[misc]  # mypy doesn't follow the self type of the first overload
         self,
-        abort_func: Callable[[WakeToken[T, D]], None],
+        on_cancel: Callable[[WakeToken[T, D]], None],
         data: D | None = None,
     ) -> None:
-        self.abort_func = abort_func
+        self.on_cancel = on_cancel
         # Only ever None when D is None, per the overloads above.
         self.data = cast("D", data)
         self._task = None
@@ -171,7 +171,7 @@ class WakeToken(Generic[T, D]):
         else:
             state = f"awaited by {self._task.name!r}"
         if self._raise_cancel is not None:
-            state += ", abort requested"
+            state += ", cancellation requested"
         return f"<WakeToken at {id(self):#x}: {state}>"
 
     # __await__ must return an iterator (Python rejects an ``async def``
@@ -185,9 +185,9 @@ class WakeToken(Generic[T, D]):
 
         def abort_wrapper(raise_cancel: RaiseCancelT) -> Abort:
             self._raise_cancel = raise_cancel
-            self.abort_func(self)
+            self.on_cancel(self)
             # We never let Trio raise the cancellation for us: either
-            # abort_func already called reschedule_aborted(), or it has
+            # on_cancel already called reschedule_cancelled(), or it has
             # arranged for the token to be rescheduled some other way.
             return _core.Abort.FAILED
 
@@ -232,18 +232,19 @@ class WakeToken(Generic[T, D]):
         self._rescheduled = True
         _core.reschedule(self._task, to_send)
 
-    def get_abort_exception(self) -> Cancelled:
-        """Create the :exc:`~trio.Cancelled` that the pending abort wants
-        delivered, to raise or to pass to :meth:`reschedule`
-        (:meth:`reschedule_aborted` does both).
+    def get_cancelled_exception(self) -> Cancelled:
+        """Create the :exc:`~trio.Cancelled` for the pending cancellation, to
+        raise or to pass to :meth:`reschedule` (:meth:`reschedule_cancelled`
+        does both).
 
-        Can only be called after ``abort_func`` has been called. Each call
+        Can only be called after ``on_cancel`` has been called. Each call
         returns a new, equivalent exception, so calling it more than once
         is fine.
         """
         if self._raise_cancel is None:
             raise RuntimeError(
-                "WakeToken.get_abort_exception() called before any abort was requested",
+                "WakeToken.get_cancelled_exception() called before any "
+                "cancellation was requested",
             )
         try:
             self._raise_cancel()
@@ -251,7 +252,7 @@ class WakeToken(Generic[T, D]):
             return exc
 
     @enable_ki_protection
-    def reschedule_aborted(self) -> None:
-        """Wake the awaiting task with the cancellation that ``abort_func``
+    def reschedule_cancelled(self) -> None:
+        """Wake the awaiting task with the cancellation that ``on_cancel``
         was asked to deliver. Convenience for the common case."""
-        self.reschedule(outcome.Error(self.get_abort_exception()))
+        self.reschedule(outcome.Error(self.get_cancelled_exception()))
