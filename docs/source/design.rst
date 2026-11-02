@@ -486,17 +486,33 @@ from the ones below it. From the bottom up:
   no other way to find its task; everything else reaches the run
   through the task.
 
-* ``_task.py`` defines :class:`~trio.lowlevel.Task`, cancel scopes and
-  the deadline bookkeeping, and the ``Scheduler``: the run queue, the
-  set of living tasks, the deadlines, the clock and the instruments,
-  with spawning and reaping. Every task refers to its run's scheduler,
-  which is how a cancel scope, a nursery or a wake token reaches the
-  run. Where this layer has to call up into a layer above, it does so
-  through a contract it defines itself and the upper layer implements:
-  a ``TaskOwner`` (a nursery, usually) is told when a task is spawned
-  and when it finishes; a ``CancelTarget`` (a wake token) is handed the
-  cancellation of a sleeping task; a ``LoopWaker`` (the runner, in guest
-  mode) is told that the run loop's timeout has to be recomputed.
+* ``_cancel_status.py`` is the cancellation tree: a ``CancelStatus``
+  for every entered cancel scope, linked into a tree, with the tasks
+  whose cancellation state it decides hanging off it, and
+  ``Deadlines``, the registry of the scopes' deadlines. It names
+  neither scopes nor tasks: what it needs from them it gets through
+  contracts it defines and they implement (``CancelStatus.Scope``,
+  ``Deadlines.Scope``, ``CancelStatus.Member``). The ``LoopWaker``
+  contract lives here too: the runner, in guest mode, implements it to
+  be told that the run loop's timeout has to be recomputed.
+
+* ``_task.py`` defines :class:`~trio.lowlevel.Task` and the
+  ``Scheduler``: the run queue, the set of living tasks, the deadlines,
+  the clock and the instruments, with spawning and reaping. Every task
+  refers to its run's scheduler, which is how a cancel scope, a nursery
+  or a wake token reaches the run. Where this layer has to call up into
+  a layer above, it does so through a contract it defines itself and
+  the upper layer implements: a ``TaskOwner`` (a nursery, usually) is
+  told when a task is spawned and when it finishes, and a
+  ``CancelTarget`` (a wake token) is handed the cancellation of a
+  sleeping task.
+
+* ``_cancel_scope.py`` defines :class:`trio.CancelScope`, the user's
+  handle on a node of the cancellation tree: entering it creates the
+  node under the current task's, and the scope's deadline, shield and
+  :meth:`~trio.CancelScope.cancel` are the policy the node reads. It
+  sits above ``_task.py`` because entering and exiting a scope need the
+  current task.
 
 * ``_wake_token.py`` defines :class:`~trio.lowlevel.WakeToken`, the one
   thing a task ever sleeps on, and ``_traps.py`` the functions that yield

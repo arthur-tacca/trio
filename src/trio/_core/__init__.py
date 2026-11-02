@@ -7,6 +7,7 @@ are publicly available in either trio, trio.lowlevel, or trio.testing.
 import sys
 import typing as _t
 
+from ._cancel_scope import CancelScope
 from ._entry_queue import TrioToken
 from ._exceptions import (
     BrokenResourceError,
@@ -39,8 +40,9 @@ from ._local import RunVar, RunVarToken
 from ._mock_clock import MockClock
 
 # Imports that always exist. The core is layered as _run -> _runner ->
-# _traps -> _wake_token -> _task -> _run_context, each importing only from
-# the modules below it; see the module docstring of _task.py.
+# _traps -> _wake_token -> _cancel_scope -> _task -> _cancel_status ->
+# _run_context, each importing only from the modules below it; see the
+# module docstring of _task.py.
 from ._run import Nursery, open_nursery, run, start_guest_run
 from ._runner import (
     RunStatistics,
@@ -51,7 +53,6 @@ from ._runner import (
 )
 from ._task import (
     TASK_STATUS_IGNORED,
-    CancelScope,
     Task,
     TaskStatus,
     add_task_exit_callback,

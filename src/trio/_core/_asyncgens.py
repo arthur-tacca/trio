@@ -9,9 +9,10 @@ from typing import TYPE_CHECKING, NoReturn, TypeVar
 import attrs
 
 from .._util import name_asyncgen
+from ._cancel_scope import CancelScope
 from ._ki import disable_ki_protection, enable_ki_protection
 from ._run_context import GLOBAL_RUN_CONTEXT
-from ._task import CancelScope, current_task
+from ._task import current_task
 from ._wake_token import WakeToken
 
 # Used to log exceptions in async generator finalizers

@@ -31,8 +31,8 @@ from ...testing import (
     assert_checkpoints,
     wait_all_tasks_blocked,
 )
+from .._cancel_status import DEADLINE_HEAP_MIN_PRUNE_THRESHOLD
 from .._runner import _count_context_run_tb_frames
-from .._task import DEADLINE_HEAP_MIN_PRUNE_THRESHOLD
 from .tutil import (
     check_sequence_matches,
     create_asyncio_future_in_new_loop,

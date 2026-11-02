@@ -29,6 +29,7 @@ from sortedcontainers import SortedDict
 
 from .._abc import Clock, Instrument
 from ._asyncgens import AsyncGenerators
+from ._cancel_status import CancelReason, Deadlines
 from ._entry_queue import EntryQueue, TrioToken
 from ._exceptions import Cancelled, RunFinishedError, TrioInternalError
 from ._instrumentation import Instruments
@@ -36,9 +37,6 @@ from ._ki import KIManager, enable_ki_protection
 from ._mock_clock import MockClock
 from ._run_context import GLOBAL_RUN_CONTEXT
 from ._task import (
-    CancelReason,
-    CancelScope,
-    Deadlines,
     Scheduler,
     Task,
     TaskOwner,
@@ -58,6 +56,7 @@ if TYPE_CHECKING:
 
     from typing_extensions import Unpack
 
+    from ._cancel_scope import CancelScope
     from ._task import BaseExcT, PosArgT
 
 

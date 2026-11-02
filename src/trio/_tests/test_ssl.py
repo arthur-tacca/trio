@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from trio._core import MockClock
     from trio._ssl import T_Stream
 
-    from .._core._task import CancelScope
+    from .._core._cancel_scope import CancelScope
 
 # We have two different kinds of echo server fixtures we use for testing. The
 # first is a real server written using the stdlib ssl module and blocking

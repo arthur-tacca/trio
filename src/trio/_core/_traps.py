@@ -20,8 +20,9 @@ from typing import (  # noqa: UP035
 import attrs
 import outcome
 
+from ._cancel_scope import CancelScope
 from ._exceptions import TrioInternalError
-from ._task import CancelScope, current_task
+from ._task import current_task
 from ._wake_token import WakeToken
 
 if TYPE_CHECKING:

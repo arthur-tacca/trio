@@ -19,6 +19,8 @@ from sniffio import thread_local as sniffio_library
 
 from .._deprecate import warn_deprecated
 from .._util import NoPublicConstructor, final, raise_saving_context
+from ._cancel_scope import NONSTRICT_EXCEPTIONGROUP_NOTE, CancelScope
+from ._cancel_status import CancelReason
 from ._exceptions import TrioInternalError
 from ._ki import enable_ki_protection
 from ._run_context import GLOBAL_RUN_CONTEXT
@@ -30,9 +32,6 @@ from ._runner import (
 )
 from ._task import (
     MISNESTING_ADVICE,
-    NONSTRICT_EXCEPTIONGROUP_NOTE,
-    CancelReason,
-    CancelScope,
     RetT,
     StatusT,
     Task,
@@ -116,7 +115,11 @@ class _TaskStatus(TaskStatus[StatusT]):
         # everything off from the old nursery before we start attaching
         # anything to the new.
         cancel_status_children = self._old_nursery._cancel_status.children
-        cancel_status_tasks = set(self._old_nursery._cancel_status.tasks)
+        # The status sees its tasks as CancelStatus.Members, but they are
+        # Tasks: Task._activate_cancel_status is what puts them there.
+        cancel_status_tasks = cast(
+            "set[Task]", set(self._old_nursery._cancel_status.tasks)
+        )
         cancel_status_tasks.discard(self._old_nursery._parent_task)
         for cancel_status in cancel_status_children:
             cancel_status.parent = None
