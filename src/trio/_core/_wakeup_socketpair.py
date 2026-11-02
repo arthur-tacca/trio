@@ -4,9 +4,13 @@ import contextlib
 import signal
 import socket
 import warnings
+from typing import TYPE_CHECKING
 
 from .. import _core
 from .._util import is_main_thread
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class WakeupSocketpair:
@@ -33,6 +37,16 @@ class WakeupSocketpair:
         with contextlib.suppress(OSError):
             self.write_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.old_wakeup_fd: int | None = None
+
+    def set_host_run_sync_soon(
+        self,
+        run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
+    ) -> None:
+        # In guest mode, this is how to reach the host loop's thread. We don't
+        # need it: writing to our socket is already safe from any thread or
+        # signal handler, and the I/O manager sees it. (The Emscripten wakeup
+        # does need it; see _wakeup_emscripten.py.)
+        pass
 
     def wakeup_thread_and_signal_safe(self) -> None:
         with contextlib.suppress(BlockingIOError):

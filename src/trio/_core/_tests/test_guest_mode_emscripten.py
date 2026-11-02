@@ -18,7 +18,7 @@ import pytest
 import trio
 import trio.testing
 from trio._core import _run
-from trio._core._io_emscripten import EmscriptenIOManager
+from trio._core._io_emscripten import EmscriptenIOManager, EventResult
 from trio._core._wakeup_emscripten import EmscriptenWakeup
 from trio.abc import Instrument
 
@@ -473,3 +473,57 @@ def test_emscripten_guest_warns_if_abandoned_during_wait() -> None:
 
     with pytest.raises(RuntimeError):
         trio.current_time()
+
+
+@pytest.mark.usefixtures("emscripten_mode")
+def test_emscripten_run_sync_soon_is_safe_at_any_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pyodide can run Trio's SIGINT handler at any bytecode boundary (through
+    # its "interrupt buffer"), and the garbage collector can run Trio's async
+    # generator finalizer anywhere. Both call TrioToken.run_sync_soon, so the
+    # wakeup must not touch the run loop's state directly, the way writing to
+    # a socketpair doesn't. Simulate the worst moment: inside guest_tick,
+    # after it has decided to wait but before the I/O manager has set the wait
+    # up. A wakeup that reschedules right there would be lost until the timer
+    # expires.
+    host = FakeBrowserLoop()
+    cancel_scope = trio.CancelScope()
+    token: trio.lowlevel.TrioToken | None = None
+    fired = False
+    real_wait_for_events = EmscriptenIOManager.wait_for_events
+
+    def wait_for_events(
+        self: EmscriptenIOManager,
+        timeout: float,
+        deliver: Callable[[Outcome[EventResult]], None],
+        *,
+        run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
+        run_sync_later: (
+            Callable[[Callable[[], object], float], Callable[[], object]] | None
+        ),
+    ) -> None:
+        nonlocal fired
+        if token is not None and not fired:
+            fired = True
+            token.run_sync_soon(cancel_scope.cancel)
+        real_wait_for_events(
+            self,
+            timeout,
+            deliver,
+            run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+            run_sync_later=run_sync_later,
+        )
+
+    monkeypatch.setattr(EmscriptenIOManager, "wait_for_events", wait_for_events)
+
+    async def main(in_host: InHost) -> str:
+        nonlocal token
+        token = trio.lowlevel.current_trio_token()
+        with cancel_scope:
+            # If the wakeup is lost, the host loop would sleep for all of
+            # this, and FakeBrowserLoop fails the test instead.
+            await trio.sleep(10)
+        return "cancelled" if cancel_scope.cancelled_caught else "slept"
+
+    assert emscripten_guest_run(main, host=host) == "cancelled"

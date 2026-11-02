@@ -2681,6 +2681,10 @@ def start_guest_run(  # type: ignore[explicit-any]
     )
     runner.is_guest = True
     runner.guest_tick_scheduled = True
+    # The entry queue's wakeup normally writes to a socket that the I/O
+    # manager watches. On Emscripten there is no socket, and it reaches the
+    # host loop through this instead; see EmscriptenWakeup.
+    runner.entry_queue.wakeup.set_host_run_sync_soon(run_sync_soon_threadsafe)
 
     if run_sync_soon_not_threadsafe is None:
         run_sync_soon_not_threadsafe = run_sync_soon_threadsafe
