@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import sys
 import time
-from collections import deque
 from typing import TYPE_CHECKING
 
 import js
@@ -22,54 +21,6 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from outcome import Outcome
-
-
-# run_sync_soon() is the hot path: Trio calls it between every two ticks, so
-# its latency is Trio's task-switching latency. Posting a message to ourselves
-# runs the callback as a task on the event loop with no delay, where
-# setTimeout(fn, 0) is clamped to 1 ms in Node and about 4 ms in browsers once
-# timers nest. In Node, a MessagePort with a handler keeps the process alive,
-# so it's only ref'd while a callback is pending (browsers have no ref/unref).
-_soon: deque[Callable[[], object]] = deque()
-_channel = js.MessageChannel.new()
-_port_keeps_node_alive = hasattr(_channel.port1, "unref")
-
-
-def _run_next_soon(event: object) -> None:
-    try:
-        _soon.popleft()()
-    finally:
-        if not _soon and _port_keeps_node_alive:
-            _channel.port1.unref()
-
-
-_channel.port1.onmessage = create_proxy(_run_next_soon)
-if _port_keeps_node_alive:
-    _channel.port1.unref()
-
-
-def run_sync_soon(fn: Callable[[], object]) -> None:
-    if not _soon and _port_keeps_node_alive:
-        _channel.port1.ref()
-    _soon.append(fn)
-    _channel.port2.postMessage(None)
-
-
-def run_sync_later(fn: Callable[[], object], delay: float) -> Callable[[], None]:
-    def fire() -> None:
-        try:
-            fn()
-        finally:
-            proxy.destroy()
-
-    proxy = create_proxy(fire)
-    handle = js.setTimeout(proxy, delay * 1000)
-
-    def cancel() -> None:
-        js.clearTimeout(handle)
-        proxy.destroy()
-
-    return cancel
 
 
 async def expect_js_error(name: str, fn: Callable[[], Awaitable[object]]) -> str:
@@ -358,13 +309,42 @@ def after_run(cancelled: str, refused: str) -> None:
     if cancelled != trio.pyodide.CANCELLED_ERROR_NAME or refused != "RuntimeError":
         js.process.exitCode = 1
         return
+    # Now that the run is over, two more runs through trio.pyodide.run(): its
+    # promise is fulfilled with the result, or rejected with the exception.
+    run_js(
+        """(startSecond, startThird, report) => {
+            startSecond().then((value) =>
+                startThird().then(null, (error) => report(value, error.name, error.message)));
+        }""",
+    )(
+        # Each of these is kept by JavaScript and called later, once
+        create_once_callable(lambda: trio.pyodide.run(double, 21)),
+        create_once_callable(lambda: trio.pyodide.run(fail, "second run failed")),
+        create_once_callable(after_runs),
+    )
+
+
+async def double(x: int) -> int:
+    await trio.sleep(0.01)
+    return x * 2
+
+
+async def fail(message: str) -> None:
+    await trio.lowlevel.checkpoint()
+    raise ValueError(message)
+
+
+def after_runs(value: int, error_name: str, error_message: str) -> None:
+    print(f"  trio.pyodide.run: fulfilled with {value!r}")
+    print(f"  trio.pyodide.run: rejected with {error_name}: {error_message}")
+    if value != 42 or (error_name, error_message) != (
+        "ValueError",
+        "second run failed",
+    ):
+        js.process.exitCode = 1
+        return
     print("PYODIDE TEST PASSED")
 
 
 assert sys.platform == "emscripten"
-trio.lowlevel.start_guest_run(
-    trio_main,
-    run_sync_soon_threadsafe=run_sync_soon,
-    run_sync_later=run_sync_later,
-    done_callback=done_callback,
-)
+trio.lowlevel.start_guest_run(trio_main, done_callback=done_callback)

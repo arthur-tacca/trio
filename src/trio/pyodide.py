@@ -1,6 +1,7 @@
-"""Trio APIs for Pyodide (Python in the browser): calling JavaScript async
-functions from Trio, calling Trio async functions from JavaScript, and an HTTP
-client built on the browser's ``fetch``. Only available on Emscripten; see
+"""Trio APIs for Pyodide (Python in the browser): starting a Trio run as a
+guest of the browser's event loop, calling JavaScript async functions from
+Trio, calling Trio async functions from JavaScript, and an HTTP client built on
+the browser's ``fetch``. Only available on Emscripten; see
 :ref:`guest-run-emscripten`.
 
 """
@@ -21,5 +22,6 @@ from ._pyodide import (
     callable_from_js as callable_from_js,
     cancel_on_abort as cancel_on_abort,
     fetch as fetch,
+    run as run,
     wait_promise as wait_promise,
 )

@@ -1042,13 +1042,11 @@ compiled to WebAssembly with Emscripten. Trio has experimental support
 for running there, with some big restrictions:
 
 - `trio.run` doesn't work, because it would block the browser's only
-  thread. Instead, you use guest mode, with the browser's event loop
-  as the host.
-
-- There are no threads on Emscripten, so Trio can't use its usual
-  trick of waiting for timeouts in a worker thread. Instead, you have
-  to pass an extra ``run_sync_later=`` argument to `start_guest_run`,
-  which Trio uses to ask the host loop to call it back after a delay.
+  thread. Instead, Trio runs in guest mode, with the browser's event
+  loop as the host: ``trio.pyodide.run(main)`` starts the run and
+  returns a JavaScript promise for its result, as described below.
+  There are no threads either, so Trio waits for its timeouts with the
+  browser's timers rather than in a worker thread.
 
 - Browsers don't offer sockets or file descriptors, so Trio doesn't do
   any I/O on Emscripten: `trio.lowlevel.wait_readable` and
@@ -1065,66 +1063,30 @@ for running there, with some big restrictions:
   JavaScript promises, and make HTTP requests with the browser's
   ``fetch``.
 
-Here's what the host loop glue looks like::
+**Starting Trio:** ``trio.pyodide.run(async_fn, *args)`` is the
+counterpart of `trio.run`. It runs ``async_fn(*args)`` as the main task
+of a guest run on the browser's event loop, and returns at once with a
+JavaScript ``Promise`` that is fulfilled with the return value, or
+rejected with the exception (converted as described for
+``callable_from_js`` below). It takes the same keyword arguments as
+`trio.run`. Await the promise from JavaScript::
 
-   from collections import deque
-   import js
-   from pyodide.ffi import create_proxy
-   import trio
+   const result = await pyodide.runPython("trio.pyodide.run(app.main)");
 
-   # Posting a message to ourselves runs the callback as a task on the
-   # event loop, with no delay (see below for why not setTimeout)
-   soon = deque()
-   channel = js.MessageChannel.new()
+or from Python code that is running under asyncio, such as the top level
+of ``pyodide.runPythonAsync``::
 
-   def run_next_soon(event):
-       soon.popleft()()
+   result = await trio.pyodide.run(main)
 
-   channel.port1.onmessage = create_proxy(run_next_soon)
-
-   def run_sync_soon(fn):
-       soon.append(fn)
-       channel.port2.postMessage(None)
-
-   def run_sync_later(fn, delay):
-       # Keep the Python function alive until it's either called or
-       # cancelled, then let it go again
-       def fire():
-           try:
-               fn()
-           finally:
-               proxy.destroy()
-
-       proxy = create_proxy(fire)
-       handle = js.setTimeout(proxy, delay * 1000)
-
-       def cancel():
-           js.clearTimeout(handle)
-           proxy.destroy()
-
-       return cancel
-
-   def done_callback(trio_main_outcome):
-       print(f"Trio program ended with: {trio_main_outcome}")
-
-   trio.lowlevel.start_guest_run(
-       trio_main,
-       run_sync_soon_threadsafe=run_sync_soon,
-       run_sync_later=run_sync_later,
-       done_callback=done_callback,
-   )
-
-``run_sync_soon`` is the hot path: Trio calls it between every two
-ticks, so its latency is Trio's task-switching latency. The
-``MessageChannel`` above runs the callback as an ordinary task on the
-event loop with no delay, a few tens of microseconds per switch.
-``setTimeout(fn, 0)`` would work too, but browsers clamp nested timers
-to about 4 ms each, which caps Trio at a couple of hundred task switches
-per second. Don't use ``queueMicrotask``: microtasks run before the
-browser gets to render or handle input, so a Trio run with runnable
-tasks would freeze the page. (In Node, a ``MessagePort`` with a handler
-keeps the process alive; call ``unref()`` on it while nothing is
-queued, or use ``setImmediate`` instead.)
+Underneath, this is `trio.lowlevel.start_guest_run`, which on Emscripten
+needs no host loop glue: Trio schedules its ticks by posting messages to
+itself on a ``MessageChannel``, which runs them as ordinary tasks on the
+event loop with no delay (``setTimeout(fn, 0)`` would be clamped to a few
+milliseconds once timers nest, and ``queueMicrotask`` would starve
+rendering), and it waits for timeouts with ``setTimeout``. Call
+`start_guest_run` yourself if you want a ``done_callback`` rather than a
+promise, or pass it a ``run_sync_soon_threadsafe`` of your own to
+schedule the ticks some other way.
 
 **Calling JavaScript from Trio, and Trio from JavaScript:** ``import
 trio.pyodide`` gives you these. (The module isn't documented with

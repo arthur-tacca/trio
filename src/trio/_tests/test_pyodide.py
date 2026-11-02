@@ -13,6 +13,11 @@ import pytest
 import trio
 import trio.lowlevel
 import trio.testing
+from trio._core._io_emscripten import EmscriptenIOManager
+from trio._core._tests.test_guest_mode_emscripten import (
+    FakeBrowserLoop,
+    enter_emscripten_mode,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -233,6 +238,51 @@ def trio_pyodide() -> Iterator[ModuleType]:
             for name in ("pyodide", "_pyodide"):
                 if hasattr(trio, name):
                     delattr(trio, name)
+
+
+################################################################
+# run
+################################################################
+
+
+def test_run_result(monkeypatch: pytest.MonkeyPatch, trio_pyodide: ModuleType) -> None:
+    enter_emscripten_mode(monkeypatch)
+    host = FakeBrowserLoop()
+    monkeypatch.setattr(EmscriptenIOManager, "host", host)
+
+    async def main(x: int) -> int:
+        await trio.sleep(0.01)
+        return x * 2
+
+    promise = trio_pyodide.run(main, 21)
+    assert isinstance(promise, FakePromise)
+    assert promise.outcome is None  # the run has only just started
+    host.run_until(lambda: promise.outcome is not None)
+    assert promise.outcome == ("fulfilled", 42)
+
+
+def test_run_exception(
+    monkeypatch: pytest.MonkeyPatch, trio_pyodide: ModuleType
+) -> None:
+    enter_emscripten_mode(monkeypatch)
+    host = FakeBrowserLoop()
+    monkeypatch.setattr(EmscriptenIOManager, "host", host)
+
+    async def main() -> None:
+        await trio.lowlevel.checkpoint()
+        raise ValueError("nope")
+
+    promise = trio_pyodide.run(main)
+    assert isinstance(promise, FakePromise)
+    host.run_until(lambda: promise.outcome is not None)
+    assert promise.outcome is not None
+    kind, error = promise.outcome
+    assert kind == "rejected"
+    assert isinstance(error, FakeJsError)
+    assert error.name == "ValueError"
+    assert error.message == "nope"
+    assert error.stack is not None
+    assert "ValueError: nope" in error.stack
 
 
 ################################################################

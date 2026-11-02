@@ -3,58 +3,11 @@ event loop and drives the demo."""
 
 from __future__ import annotations
 
-from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import js
 import trio
 import trio.pyodide
-from pyodide.ffi import create_proxy
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from outcome import Outcome
-
-# --- host loop glue: how Trio asks the browser to call it back -------------
-
-
-# run_sync_soon() is the hot path: Trio calls it between every two ticks, so
-# its latency is Trio's task-switching latency. Posting a message to ourselves
-# runs the callback as a task on the event loop with no delay, where
-# setTimeout(fn, 0) would be clamped to about 4 ms once timers nest.
-_soon: deque[Callable[[], object]] = deque()
-_channel = js.MessageChannel.new()
-
-
-def _run_next_soon(event: object) -> None:
-    _soon.popleft()()
-
-
-_channel.port1.onmessage = create_proxy(_run_next_soon)
-
-
-def run_sync_soon(fn: Callable[[], object]) -> None:
-    _soon.append(fn)
-    _channel.port2.postMessage(None)
-
-
-def run_sync_later(fn: Callable[[], object], delay: float) -> Callable[[], None]:
-    def fire() -> None:
-        try:
-            fn()
-        finally:
-            proxy.destroy()
-
-    proxy = create_proxy(fire)
-    handle = js.setTimeout(proxy, delay * 1000)
-
-    def cancel() -> None:
-        js.clearTimeout(handle)
-        proxy.destroy()
-
-    return cancel
-
 
 # --- the demo ---------------------------------------------------------------
 
@@ -185,13 +138,13 @@ async def main() -> None:
         await trio.sleep_forever()
 
 
-def done_callback(outcome: Outcome[None]) -> None:
-    element("status").textContent = f"Trio finished: {outcome}"
+def report_end(text: str) -> None:
+    element("status").textContent = text
 
 
-trio.lowlevel.start_guest_run(
-    main,
-    run_sync_soon_threadsafe=run_sync_soon,
-    run_sync_later=run_sync_later,
-    done_callback=done_callback,
+# Start Trio as a guest of the browser's event loop. main() runs until the
+# page goes away, so the promise only ever settles if something goes wrong.
+trio.pyodide.run(main).then(
+    lambda value: report_end(f"Trio finished: {value}"),
+    lambda error: report_end(f"Trio failed: {error}"),
 )

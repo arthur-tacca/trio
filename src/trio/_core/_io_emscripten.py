@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import weakref
-from typing import TYPE_CHECKING, Literal, TypeAlias
+from collections import deque
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAlias
 
 import attrs
 from outcome import capture
@@ -19,12 +20,89 @@ if TYPE_CHECKING:
 # sockets, no worker threads, and no way to block its single thread while
 # waiting for I/O. So this "I/O manager" doesn't do any I/O at all: the wait_*
 # functions all raise NotImplementedError. What it does provide is the part of
-# guest mode that depends on the platform: waiting for a timeout, which it does
-# with a host loop timer rather than by blocking in get_events() on a worker
-# thread, and cutting that wait short when force_wakeup() is called.
+# guest mode that depends on the platform: scheduling Trio's ticks on the
+# browser's event loop, waiting for a timeout with one of the browser's timers
+# rather than by blocking in get_events() on a worker thread, and cutting that
+# wait short when force_wakeup() is called.
 
 # Non-empty iff force_wakeup() was called since the last call to get_events()
 EventResult: TypeAlias = "list[None]"
+
+
+class _HostLoop(Protocol):
+    """What this I/O manager needs from the browser's event loop."""
+
+    def run_sync_soon(self, fn: Callable[[], object]) -> object: ...
+
+    def run_sync_later(
+        self,
+        fn: Callable[[], object],
+        delay: float,
+    ) -> Callable[[], object]: ...
+
+
+class _JsHostLoop:
+    """The browser's event loop, reached through Pyodide's FFI.
+
+    run_sync_soon() is the hot path: Trio calls it between every two ticks,
+    so its latency is Trio's task-switching latency. Posting a message to
+    ourselves runs the callback as a task on the event loop with no delay,
+    where setTimeout(fn, 0) is clamped to 1 ms in Node and about 4 ms in
+    browsers once timers nest. (queueMicrotask would be faster still, but
+    microtasks run before the browser gets to render or handle input, so a
+    run with runnable tasks would freeze the page.) In Node, a MessagePort
+    with a handler keeps the process alive, so it's only ref'd while a
+    callback is queued; browsers have no ref/unref.
+
+    """
+
+    def __init__(self) -> None:
+        import js
+        from pyodide.ffi import create_proxy
+
+        self._js = js
+        self._create_proxy = create_proxy
+        self._soon: deque[Callable[[], object]] = deque()
+        self._channel = js.MessageChannel.new()
+        self._port_keeps_node_alive = hasattr(self._channel.port1, "unref")
+        self._channel.port1.onmessage = create_proxy(self._run_next_soon)
+        if self._port_keeps_node_alive:
+            self._channel.port1.unref()
+
+    def _run_next_soon(self, event: object) -> None:
+        try:
+            self._soon.popleft()()
+        finally:
+            if not self._soon and self._port_keeps_node_alive:
+                self._channel.port1.unref()
+
+    def run_sync_soon(self, fn: Callable[[], object]) -> None:
+        if not self._soon and self._port_keeps_node_alive:
+            self._channel.port1.ref()
+        self._soon.append(fn)
+        self._channel.port2.postMessage(None)
+
+    def run_sync_later(
+        self,
+        fn: Callable[[], object],
+        delay: float,
+    ) -> Callable[[], None]:
+        # Keep the Python function alive until it's either called or
+        # cancelled, then let it go again
+        def fire() -> None:
+            try:
+                fn()
+            finally:
+                proxy.destroy()
+
+        proxy = self._create_proxy(fire)
+        handle = self._js.setTimeout(proxy, delay * 1000)
+
+        def cancel() -> None:
+            self._js.clearTimeout(handle)
+            proxy.destroy()
+
+        return cancel
 
 
 @attrs.frozen(eq=False)
@@ -82,9 +160,20 @@ class _Wait:
 
 @attrs.define(eq=False)
 class EmscriptenIOManager:
+    # The browser's event loop. Created on first use, so that this module can
+    # be imported, and the manager tested with a fake host loop, on other
+    # platforms (the tests set this directly).
+    host: ClassVar[_HostLoop | None] = None
+
     _force_wakeup_pending: bool = False
     # The guest-mode wait in progress, if any. A weak reference: see _Wait.
     _wait: weakref.ref[_Wait] | None = None
+
+    @classmethod
+    def _get_host(cls) -> _HostLoop:
+        if cls.host is None:
+            cls.host = _JsHostLoop()
+        return cls.host
 
     def statistics(self) -> _EmscriptenStatistics:
         return _EmscriptenStatistics()
@@ -92,27 +181,34 @@ class EmscriptenIOManager:
     def close(self) -> None:
         pass
 
+    def run_sync_soon(self, fn: Callable[[], object]) -> None:
+        """Run ``fn()`` on the browser's event loop as soon as possible.
+
+        This is what `start_guest_run` uses for ``run_sync_soon_threadsafe``
+        on Emscripten when the caller doesn't pass one.
+        """
+        self._get_host().run_sync_soon(fn)
+
     def wait_for_events(
         self,
         timeout: float,
         deliver: Callable[[Outcome[EventResult]], None],
         *,
         run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
-        run_sync_later: (
-            Callable[[Callable[[], object], float], Callable[[], object]] | None
-        ),
     ) -> None:
         """Guest mode: wait for the timeout, or for force_wakeup(), then call
         ``deliver`` on the main thread with the outcome of get_events(0).
 
-        There's nothing to wait for but the timeout, so this asks the host
-        loop for a timer (start_guest_run's run_sync_later=); force_wakeup()
-        cancels that timer and delivers right away instead.
+        There's nothing to wait for but the timeout, so this asks the browser
+        for a timer; force_wakeup() cancels that timer and delivers right away
+        instead.
         """
         assert self._current_wait() is None, "a wait is already in progress"
-        assert run_sync_later is not None  # start_guest_run checks this
         wait = _Wait(self, deliver, run_sync_soon_threadsafe)
-        wait.cancel_timer = run_sync_later(wait.timer_expired, timeout)
+        wait.cancel_timer = self._get_host().run_sync_later(
+            wait.timer_expired,
+            timeout,
+        )
         self._wait = weakref.ref(wait)
 
     def _current_wait(self) -> _Wait | None:

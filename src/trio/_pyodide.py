@@ -1,10 +1,10 @@
-"""Trio support for Pyodide (Python in the browser): calling JavaScript async
-functions from Trio tasks, calling Trio async functions from JavaScript, and
-an HTTP client built on the browser's ``fetch``.
+"""Trio support for Pyodide (Python in the browser): starting a Trio run as a
+guest of the browser's event loop, calling JavaScript async functions from
+Trio tasks, calling Trio async functions from JavaScript, and an HTTP client
+built on the browser's ``fetch``.
 
-This only works on Emscripten, with Trio running in guest mode on top of the
-JavaScript event loop; see the "Running Trio in the browser with Pyodide"
-section of the docs.
+This only works on Emscripten; see the "Running Trio in the browser with
+Pyodide" section of the docs.
 
 """
 
@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from typing import Final, NamedTuple
 
 import js
-from outcome import Value
+from outcome import Outcome, Value
 from pyodide.code import run_js
 from pyodide.ffi import JsException, create_proxy, to_js
 
@@ -34,11 +34,12 @@ from ._abc import ReceiveStream
 from ._util import final
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator, Mapping
+    from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 
     from typing_extensions import Self
 
     from ._core._traps import Abort, RaiseCancelT
+    from .abc import Clock, Instrument
 
 # The convention for cancellation: when a Trio task waiting on a JavaScript
 # operation is cancelled, we abort its AbortController with a JavaScript Error
@@ -70,6 +71,69 @@ class JsPromiseRejected(Exception):
 
 class _Rejected(NamedTuple):
     reason: object
+
+
+################################################################
+# Starting a Trio run
+################################################################
+
+
+def run(
+    async_fn: Callable[..., Awaitable[object]],
+    *args: object,
+    clock: Clock | None = None,
+    instruments: Sequence[Instrument] = (),
+    restrict_keyboard_interrupt_to_checkpoints: bool = False,
+    strict_exception_groups: bool = True,
+) -> object:
+    """Start a Trio run as a guest of the browser's event loop, and return a
+    JavaScript ``Promise`` for its result.
+
+    This is the Pyodide counterpart of `trio.run`, which can't work in a
+    browser because it would block the page's only thread. Like `trio.run`,
+    it runs ``async_fn(*args)`` as the main task, and the result is the
+    value it returns or the exception it raises: the promise is fulfilled
+    with the return value (converted with `pyodide.ffi.to_js`), or rejected
+    with the exception, converted the same way as for `callable_from_js`.
+    Unlike `trio.run`, it returns at once, and the run proceeds as the
+    browser runs the callbacks Trio asks for.
+
+    Await the promise from JavaScript (``await pyodide.runPython(...)`` hands
+    it back as a promise), or from Python code running under asyncio, such as
+    the top level of ``pyodide.runPythonAsync``::
+
+        result = await trio.pyodide.run(main)
+
+    For the keyword arguments, see `trio.run`. Only one Trio run can be
+    active at a time. If you need to supply your own host loop glue or done
+    callback, use `trio.lowlevel.start_guest_run` instead; on Emscripten it
+    needs neither.
+
+    """
+    resolvers: list[object] = []
+    promise = js.Promise.new(
+        lambda resolve, reject: resolvers.extend((resolve, reject))
+    )
+    resolve, reject = resolvers
+
+    def done(outcome: Outcome[object]) -> None:
+        try:
+            result = outcome.unwrap()
+        except BaseException as exc:
+            reject(_error_from_exception(exc))
+        else:
+            resolve(to_js(result))
+
+    trio.lowlevel.start_guest_run(
+        async_fn,
+        *args,
+        done_callback=done,
+        clock=clock,
+        instruments=instruments,
+        restrict_keyboard_interrupt_to_checkpoints=restrict_keyboard_interrupt_to_checkpoints,
+        strict_exception_groups=strict_exception_groups,
+    )
+    return promise
 
 
 ################################################################

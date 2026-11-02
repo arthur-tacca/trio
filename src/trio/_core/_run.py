@@ -1738,12 +1738,6 @@ class GuestState:  # type: ignore[explicit-any]
     done_callback: Callable[[Outcome[Any]], object]  # type: ignore[explicit-any]
     unrolled_run_gen: Generator[float, EventResult, None]
     unrolled_run_next_send: Outcome[Any] = attrs.Factory(lambda: Value(None))  # type: ignore[explicit-any]
-    # Emscripten only: asks the host loop to call a function after a delay,
-    # and returns a function that cancels that. It's handed to the I/O
-    # manager, which waits for timeouts with it. See start_guest_run.
-    run_sync_later: (
-        Callable[[Callable[[], object], float], Callable[[], object]] | None
-    ) = None
 
     def guest_tick(self) -> None:
         prev_library, sniffio_library.name = sniffio_library.name, "trio"
@@ -1773,7 +1767,7 @@ class GuestState:  # type: ignore[explicit-any]
             # Wait for I/O, the timeout, or a force_wakeup(), without blocking
             # this thread. How is up to the I/O manager: the ones that can
             # block in get_events() do so on a worker thread, and the
-            # Emscripten one asks the host loop for a timer instead. Either
+            # Emscripten one asks the browser for a timer instead. Either
             # way, deliver_events() is called on the main thread once the
             # wait is over.
             self.runner.guest_tick_scheduled = False
@@ -1781,7 +1775,6 @@ class GuestState:  # type: ignore[explicit-any]
                 timeout,
                 self.deliver_events,
                 run_sync_soon_threadsafe=self.run_sync_soon_threadsafe,
-                run_sync_later=self.run_sync_later,
             )
 
     def deliver_events(self, events_outcome: Outcome[EventResult]) -> None:
@@ -2513,7 +2506,7 @@ def run(
     if sys.platform == "emscripten":
         raise NotImplementedError(
             "trio.run() isn't supported on Emscripten, because it would have "
-            "to block the browser's main thread; use "
+            "to block the browser's main thread; use trio.pyodide.run() or "
             "trio.lowlevel.start_guest_run() instead",
         )
 
@@ -2564,15 +2557,12 @@ def run(
 def start_guest_run(  # type: ignore[explicit-any]
     async_fn: Callable[..., Awaitable[RetT]],
     *args: object,
-    run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
     done_callback: Callable[[outcome.Outcome[RetT]], object],
+    run_sync_soon_threadsafe: Callable[[Callable[[], object]], object] | None = None,
     run_sync_soon_not_threadsafe: (
         Callable[[Callable[[], object]], object] | None
     ) = None,
     host_uses_signal_set_wakeup_fd: bool = False,
-    run_sync_later: (
-        Callable[[Callable[[], object], float], Callable[[], object]] | None
-    ) = None,
     clock: Clock | None = None,
     instruments: Sequence[Instrument] = (),
     restrict_keyboard_interrupt_to_checkpoints: bool = False,
@@ -2611,7 +2601,10 @@ def start_guest_run(  # type: ignore[explicit-any]
 
          This callable should schedule ``fn()`` to be run by the host on its
          next pass through its loop. **Must support being called from
-         arbitrary threads.**
+         arbitrary threads.** Required, except on Emscripten (e.g. Pyodide),
+         where the host is the browser's event loop and Trio knows how to
+         schedule on it; pass one there only to use your own scheduling. See
+         :ref:`guest-run-emscripten`.
 
       done_callback: An arbitrary callable::
 
@@ -2634,21 +2627,6 @@ def start_guest_run(  # type: ignore[explicit-any]
          uses `signal.set_wakeup_fd`, and `False` otherwise. For more details,
          see :ref:`guest-run-implementation`.
 
-      run_sync_later: Only used on Emscripten (e.g. Pyodide), where it's
-         required; on other platforms it must not be passed. An arbitrary
-         callable, which will be passed a function and a delay in seconds::
-
-            def my_run_sync_later(fn, delay):
-                ...
-                return cancel
-
-         This callable should schedule ``fn()`` to be run by the host after
-         ``delay`` seconds, and return a zero-argument function that cancels
-         that if it hasn't happened yet. Trio uses it instead of a worker
-         thread to wait for its timeouts, because Emscripten has no threads.
-         It will only be called from the host loop's thread. For more
-         details, see :ref:`guest-run-emscripten`.
-
     For the meaning of other arguments, see `trio.run`.
 
     """
@@ -2664,14 +2642,13 @@ def start_guest_run(  # type: ignore[explicit-any]
             use_triodeprecationwarning=True,
         )
 
-    if sys.platform == "emscripten":
-        if run_sync_later is None:
-            raise TypeError(
-                "start_guest_run() requires run_sync_later= on Emscripten, "
-                "because there are no worker threads to wait for timeouts in",
-            )
-    elif run_sync_later is not None:
-        raise TypeError("run_sync_later= is only supported on Emscripten")
+    if run_sync_soon_threadsafe is None and sys.platform != "emscripten":
+        raise TypeError(
+            "start_guest_run() missing required argument: "
+            "'run_sync_soon_threadsafe'",
+        )
+        # The browser's event loop is the host, and the I/O manager knows
+        # how to schedule on it. This is set after the runner exists, below.
 
     runner = setup_runner(
         clock,
@@ -2681,6 +2658,13 @@ def start_guest_run(  # type: ignore[explicit-any]
     )
     runner.is_guest = True
     runner.guest_tick_scheduled = True
+    if run_sync_soon_threadsafe is None:
+        # Checked above: this is Emscripten, where the I/O manager knows how
+        # to schedule on the browser's event loop.
+        if sys.platform == "emscripten":
+            run_sync_soon_threadsafe = runner.io_manager.run_sync_soon
+        else:  # pragma: no cover
+            raise AssertionError("unreachable")
     # The entry queue's wakeup normally writes to a socket that the I/O
     # manager watches. On Emscripten there is no socket, and it reaches the
     # host loop through this instead; see EmscriptenWakeup.
@@ -2700,7 +2684,6 @@ def start_guest_run(  # type: ignore[explicit-any]
             args,
             host_uses_signal_set_wakeup_fd=host_uses_signal_set_wakeup_fd,
         ),
-        run_sync_later=run_sync_later,
     )
     # Run a few ticks of the guest run synchronously, so that by the
     # time we return, the system nursery exists and callers can use

@@ -10,12 +10,11 @@ from __future__ import annotations
 import math
 import sys
 import time
-from collections import deque
 from typing import TYPE_CHECKING
 
 import js
 import trio
-from pyodide.ffi import create_once_callable, create_proxy
+from pyodide.ffi import create_once_callable
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -24,60 +23,6 @@ if TYPE_CHECKING:
 
 if sys.version_info < (3, 11):  # pragma: no cover
     from exceptiongroup import BaseExceptionGroup
-
-stats = {"run_sync_soon": 0, "timers started": 0, "timers cancelled": 0}
-
-
-# run_sync_soon() is the hot path: Trio calls it between every two ticks, so
-# its latency is Trio's task-switching latency. Posting a message to ourselves
-# runs the callback as a task on the event loop with no delay, where
-# setTimeout(fn, 0) is clamped to 1 ms in Node and about 4 ms in browsers once
-# timers nest. In Node, a MessagePort with a handler keeps the process alive,
-# so it's only ref'd while a callback is pending (browsers have no ref/unref).
-_soon: deque[Callable[[], object]] = deque()
-_channel = js.MessageChannel.new()
-_port_keeps_node_alive = hasattr(_channel.port1, "unref")
-
-
-def _run_next_soon(event: object) -> None:
-    try:
-        _soon.popleft()()
-    finally:
-        if not _soon and _port_keeps_node_alive:
-            _channel.port1.unref()
-
-
-_channel.port1.onmessage = create_proxy(_run_next_soon)
-if _port_keeps_node_alive:
-    _channel.port1.unref()
-
-
-def run_sync_soon(fn: Callable[[], object]) -> None:
-    stats["run_sync_soon"] += 1
-    if not _soon and _port_keeps_node_alive:
-        _channel.port1.ref()
-    _soon.append(fn)
-    _channel.port2.postMessage(None)
-
-
-def run_sync_later(fn: Callable[[], object], delay: float) -> Callable[[], None]:
-    stats["timers started"] += 1
-
-    def fire() -> None:
-        try:
-            fn()
-        finally:
-            proxy.destroy()
-
-    proxy = create_proxy(fire)
-    handle = js.setTimeout(proxy, delay * 1000)
-
-    def cancel() -> None:
-        stats["timers cancelled"] += 1
-        js.clearTimeout(handle)
-        proxy.destroy()
-
-    return cancel
 
 
 def from_js_later(fn: Callable[[], object], delay_ms: int) -> None:
@@ -190,14 +135,8 @@ def done_callback(outcome: Outcome[dict[str, object]]) -> None:
     print("guest run finished after", round(time.perf_counter() - started, 3), "s")
     for key, value in results.items():
         print(f"  {key}: {value}")
-    print("host stats:", stats)
     print("SMOKE TEST PASSED")
 
 
-trio.lowlevel.start_guest_run(
-    trio_main,
-    run_sync_soon_threadsafe=run_sync_soon,
-    run_sync_later=run_sync_later,
-    done_callback=done_callback,
-)
+trio.lowlevel.start_guest_run(trio_main, done_callback=done_callback)
 print("start_guest_run returned; the JS event loop now drives Trio")

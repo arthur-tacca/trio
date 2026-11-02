@@ -117,23 +117,29 @@ def emscripten_guest_run(
         nonlocal result
         result = outcome
 
-    trio.lowlevel.start_guest_run(
-        trio_fn,
-        host.run_sync_soon,
-        run_sync_soon_threadsafe=host.run_sync_soon,
-        run_sync_later=host.run_sync_later,
-        done_callback=done_callback,
-        clock=clock,
-    )
+    # The I/O manager schedules on, and takes its timers from, this host
+    # loop, the way it would from the browser; start_guest_run then needs
+    # no host callbacks at all.
+    assert EmscriptenIOManager.host is None
+    EmscriptenIOManager.host = host
     try:
-        host.run_until(lambda: result is not None)
-    except BaseException:
-        # The host loop is dead, so drop its pending callbacks and timers.
-        # Those are what keep an abandoned guest run alive, so this gives
-        # Trio's state a chance to be GC'ed and warn about it.
-        host.soon.clear()
-        host.timers.clear()
-        raise
+        trio.lowlevel.start_guest_run(
+            trio_fn,
+            host.run_sync_soon,
+            done_callback=done_callback,
+            clock=clock,
+        )
+        try:
+            host.run_until(lambda: result is not None)
+        except BaseException:
+            # The host loop is dead, so drop its pending callbacks and timers.
+            # Those are what keep an abandoned guest run alive, so this gives
+            # Trio's state a chance to be GC'ed and warn about it.
+            host.soon.clear()
+            host.timers.clear()
+            raise
+    finally:
+        EmscriptenIOManager.host = None
     assert result is not None
     return result.unwrap()
 
@@ -389,35 +395,71 @@ def test_emscripten_unsupported_apis() -> None:
         trio.run(trio.sleep, 0)
 
 
-def test_emscripten_run_sync_later_validation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    host = FakeBrowserLoop()
+def test_run_sync_soon_threadsafe_is_required_off_emscripten() -> None:
+    if sys.platform == "emscripten":  # pragma: no cover
+        pytest.skip("on Emscripten it has a default")
 
-    async def trio_main(in_host: InHost) -> None:
+    async def trio_main() -> None:
         raise AssertionError("should never run")  # pragma: no cover
 
     def done_callback(outcome: Outcome[None]) -> None:
         raise AssertionError("should never run")  # pragma: no cover
 
-    if sys.platform != "emscripten":  # pragma: no branch
-        with pytest.raises(TypeError, match="only supported on Emscripten"):
-            trio.lowlevel.start_guest_run(
-                trio_main,
-                host.run_sync_soon,
-                run_sync_soon_threadsafe=host.run_sync_soon,
-                run_sync_later=host.run_sync_later,
-                done_callback=done_callback,
-            )
+    with pytest.raises(TypeError, match="run_sync_soon_threadsafe"):
+        trio.lowlevel.start_guest_run(trio_main, done_callback=done_callback)
 
-    enter_emscripten_mode(monkeypatch)
-    with pytest.raises(TypeError, match="requires run_sync_later="):
+
+@pytest.mark.usefixtures("emscripten_mode")
+def test_emscripten_default_run_sync_soon_comes_from_the_io_manager() -> None:
+    # emscripten_guest_run doesn't pass run_sync_soon_threadsafe, so every
+    # tick was scheduled through the I/O manager's host loop.
+    host = FakeBrowserLoop()
+
+    async def trio_main(in_host: InHost) -> str:
+        for _ in range(3):
+            await trio.lowlevel.checkpoint()
+        return "ok"
+
+    assert emscripten_guest_run(trio_main, host=host) == "ok"
+    assert host.soon_calls >= 3
+
+
+@pytest.mark.usefixtures("emscripten_mode")
+def test_emscripten_explicit_run_sync_soon_is_used() -> None:
+    # A caller who passes run_sync_soon_threadsafe gets it used for the
+    # ticks instead of the I/O manager's own scheduling.
+    host = FakeBrowserLoop()
+    scheduled: list[Callable[[], object]] = []
+
+    def my_run_sync_soon(fn: Callable[[], object]) -> None:
+        scheduled.append(fn)
+        host.run_sync_soon(fn)
+
+    result: Outcome[str] | None = None
+
+    def done_callback(outcome: Outcome[str]) -> None:
+        nonlocal result
+        result = outcome
+
+    async def trio_main() -> str:
+        for _ in range(3):
+            await trio.lowlevel.checkpoint()
+        return "ok"
+
+    EmscriptenIOManager.host = host
+    try:
         trio.lowlevel.start_guest_run(
             trio_main,
-            host.run_sync_soon,
-            run_sync_soon_threadsafe=host.run_sync_soon,
+            run_sync_soon_threadsafe=my_run_sync_soon,
             done_callback=done_callback,
         )
+        host.run_until(lambda: result is not None)
+    finally:
+        EmscriptenIOManager.host = None
+    assert result is not None
+    assert result.unwrap() == "ok"
+    assert len(scheduled) >= 3
+    assert host.soon_calls == len(scheduled)
     # Nothing got left behind
     assert not host.soon
     assert not trio.lowlevel.in_trio_run()
@@ -499,9 +541,6 @@ def test_emscripten_run_sync_soon_is_safe_at_any_point(
         deliver: Callable[[Outcome[EventResult]], None],
         *,
         run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
-        run_sync_later: (
-            Callable[[Callable[[], object], float], Callable[[], object]] | None
-        ),
     ) -> None:
         nonlocal fired
         if token is not None and not fired:
@@ -512,7 +551,6 @@ def test_emscripten_run_sync_soon_is_safe_at_any_point(
             timeout,
             deliver,
             run_sync_soon_threadsafe=run_sync_soon_threadsafe,
-            run_sync_later=run_sync_later,
         )
 
     monkeypatch.setattr(EmscriptenIOManager, "wait_for_events", wait_for_events)

@@ -71,12 +71,8 @@ class KqueueIOManager:
         deliver: Callable[[outcome.Outcome[EventResult]], None],
         *,
         run_sync_soon_threadsafe: Callable[[Callable[[], object]], object],
-        run_sync_later: (
-            Callable[[Callable[[], object], float], Callable[[], object]] | None
-        ),
     ) -> None:
-        # Guest mode. run_sync_later is only for I/O managers that can't
-        # block (Emscripten); this one waits on a worker thread.
+        # Guest mode: get_events() blocks, so wait on a worker thread
         wait_for_events_in_thread(
             self.get_events, timeout, deliver, run_sync_soon_threadsafe
         )
