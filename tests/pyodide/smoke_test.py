@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import sys
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 import js
@@ -27,9 +28,36 @@ if sys.version_info < (3, 11):  # pragma: no cover
 stats = {"run_sync_soon": 0, "timers started": 0, "timers cancelled": 0}
 
 
+# run_sync_soon() is the hot path: Trio calls it between every two ticks, so
+# its latency is Trio's task-switching latency. Posting a message to ourselves
+# runs the callback as a task on the event loop with no delay, where
+# setTimeout(fn, 0) is clamped to 1 ms in Node and about 4 ms in browsers once
+# timers nest. In Node, a MessagePort with a handler keeps the process alive,
+# so it's only ref'd while a callback is pending (browsers have no ref/unref).
+_soon: deque[Callable[[], object]] = deque()
+_channel = js.MessageChannel.new()
+_port_keeps_node_alive = hasattr(_channel.port1, "unref")
+
+
+def _run_next_soon(event: object) -> None:
+    try:
+        _soon.popleft()()
+    finally:
+        if not _soon and _port_keeps_node_alive:
+            _channel.port1.unref()
+
+
+_channel.port1.onmessage = create_proxy(_run_next_soon)
+if _port_keeps_node_alive:
+    _channel.port1.unref()
+
+
 def run_sync_soon(fn: Callable[[], object]) -> None:
     stats["run_sync_soon"] += 1
-    js.setTimeout(create_once_callable(fn), 0)
+    if not _soon and _port_keeps_node_alive:
+        _channel.port1.ref()
+    _soon.append(fn)
+    _channel.port2.postMessage(None)
 
 
 def run_sync_later(fn: Callable[[], object], delay: float) -> Callable[[], None]:

@@ -14,8 +14,8 @@ JavaScript awaiting a Trio async function.
 
 - `index.html`, `demo.js`: load Pyodide from the jsDelivr CDN, unpack the wheels
   into the Pyodide filesystem, then run `demo.py`.
-- `demo.py`: the guest-mode glue (`run_sync_soon` and `run_sync_later` on top
-  of `setTimeout`) and the Trio tasks behind the page.
+- `demo.py`: the guest-mode glue (`run_sync_soon` on top of a `MessageChannel`,
+  `run_sync_later` on top of `setTimeout`) and the Trio tasks behind the page.
 - `build_wheels.py`: builds the Trio wheel from this checkout and downloads its
   pure-Python dependencies into `wheels/`, with a `wheels/index.json` listing
   them. The `wheels/` directory is generated and not committed.

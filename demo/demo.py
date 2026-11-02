@@ -3,12 +3,13 @@ event loop and drives the demo."""
 
 from __future__ import annotations
 
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import js
 import trio
 import trio.pyodide
-from pyodide.ffi import create_once_callable, create_proxy
+from pyodide.ffi import create_proxy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -18,8 +19,24 @@ if TYPE_CHECKING:
 # --- host loop glue: how Trio asks the browser to call it back -------------
 
 
+# run_sync_soon() is the hot path: Trio calls it between every two ticks, so
+# its latency is Trio's task-switching latency. Posting a message to ourselves
+# runs the callback as a task on the event loop with no delay, where
+# setTimeout(fn, 0) would be clamped to about 4 ms once timers nest.
+_soon: deque[Callable[[], object]] = deque()
+_channel = js.MessageChannel.new()
+
+
+def _run_next_soon(event: object) -> None:
+    _soon.popleft()()
+
+
+_channel.port1.onmessage = create_proxy(_run_next_soon)
+
+
 def run_sync_soon(fn: Callable[[], object]) -> None:
-    js.setTimeout(create_once_callable(fn), 0)
+    _soon.append(fn)
+    _channel.port2.postMessage(None)
 
 
 def run_sync_later(fn: Callable[[], object], delay: float) -> Callable[[], None]:

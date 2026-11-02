@@ -1067,12 +1067,24 @@ for running there, with some big restrictions:
 
 Here's what the host loop glue looks like::
 
+   from collections import deque
    import js
-   from pyodide.ffi import create_once_callable, create_proxy
+   from pyodide.ffi import create_proxy
    import trio
 
+   # Posting a message to ourselves runs the callback as a task on the
+   # event loop, with no delay (see below for why not setTimeout)
+   soon = deque()
+   channel = js.MessageChannel.new()
+
+   def run_next_soon(event):
+       soon.popleft()()
+
+   channel.port1.onmessage = create_proxy(run_next_soon)
+
    def run_sync_soon(fn):
-       js.setTimeout(create_once_callable(fn), 0)
+       soon.append(fn)
+       channel.port2.postMessage(None)
 
    def run_sync_later(fn, delay):
        # Keep the Python function alive until it's either called or
@@ -1102,10 +1114,17 @@ Here's what the host loop glue looks like::
        done_callback=done_callback,
    )
 
-(Browsers clamp nested ``setTimeout(..., 0)`` calls to a few
-milliseconds, which limits how fast Trio can switch between tasks. If
-that matters to you, use something like a ``MessageChannel`` to
-implement ``run_sync_soon`` instead.)
+``run_sync_soon`` is the hot path: Trio calls it between every two
+ticks, so its latency is Trio's task-switching latency. The
+``MessageChannel`` above runs the callback as an ordinary task on the
+event loop with no delay, a few tens of microseconds per switch.
+``setTimeout(fn, 0)`` would work too, but browsers clamp nested timers
+to about 4 ms each, which caps Trio at a couple of hundred task switches
+per second. Don't use ``queueMicrotask``: microtasks run before the
+browser gets to render or handle input, so a Trio run with runnable
+tasks would freeze the page. (In Node, a ``MessagePort`` with a handler
+keeps the process alive; call ``unref()`` on it while nothing is
+queued, or use ``setImmediate`` instead.)
 
 **Calling JavaScript from Trio, and Trio from JavaScript:** ``import
 trio.pyodide`` gives you these. (The module isn't documented with
