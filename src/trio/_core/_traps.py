@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import types
+from math import inf
 
 # typing.Callable is necessary because collections.abc.Callable breaks
 # test_static_tool_sees_all_symbols in 3.10.
@@ -19,9 +20,8 @@ from typing import (  # noqa: UP035
 import attrs
 import outcome
 
-from . import _task
 from ._exceptions import TrioInternalError
-from ._run_context import GLOBAL_RUN_CONTEXT
+from ._task import CancelScope, current_task
 from ._wake_token import WakeToken
 
 if TYPE_CHECKING:
@@ -87,6 +87,58 @@ async def cancel_shielded_checkpoint() -> None:
 
     """
     (await _async_yield(CancelShieldedCheckpoint)).unwrap()
+
+
+async def checkpoint() -> None:
+    """A pure :ref:`checkpoint <checkpoints>`.
+
+    This checks for cancellation and allows other tasks to be scheduled,
+    without otherwise blocking.
+
+    Note that the scheduler has the option of ignoring this and continuing to
+    run the current task if it decides this is appropriate (e.g. for increased
+    efficiency).
+
+    Equivalent to ``await trio.sleep(0)`` (which is implemented by calling
+    :func:`checkpoint`.)
+
+    """
+    # The scheduler is what checks timeouts and converts them into
+    # cancellations. So by doing the schedule point first, we ensure that the
+    # cancel point has the most up-to-date info.
+    await cancel_shielded_checkpoint()
+    task = current_task()
+    task._cancel_points += 1
+    if task._cancel_status.effectively_cancelled:
+        cs = CancelScope(deadline=-inf)
+        assert task._cancel_status._scope._cancel_reason is not None
+        cs._cancel_reason = task._cancel_status._scope._cancel_reason
+        with cs:
+            # Nothing to clean up on cancellation: on_cancel just delivers it.
+            token = WakeToken(WakeToken.reschedule_cancelled)
+            await token
+
+
+async def checkpoint_if_cancelled() -> None:
+    """Issue a :ref:`checkpoint <checkpoints>` if the calling context has been
+    cancelled.
+
+    Equivalent to (but potentially more efficient than)::
+
+        if trio.current_effective_deadline() == -inf:
+            await trio.lowlevel.checkpoint()
+
+    This is either a no-op, or else it allow other tasks to be scheduled and
+    then raises :exc:`trio.Cancelled`.
+
+    Typically used together with :func:`cancel_shielded_checkpoint`.
+
+    """
+    task = current_task()
+    if task._cancel_status.effectively_cancelled:
+        await checkpoint()
+        raise AssertionError("this should never happen")  # pragma: no cover
+    task._cancel_points += 1
 
 
 # Return values for abort functions
@@ -269,7 +321,7 @@ async def permanently_detach_coroutine_object(
     uses to resume the coroutine.
 
     """
-    if _task.current_task().child_nurseries:
+    if current_task().child_nurseries:
         raise RuntimeError(
             "can't permanently detach a coroutine object with open nurseries",
         )
@@ -340,6 +392,17 @@ async def reattach_detached_coroutine_object(task: Task, yield_value: object) ->
     # check, so I guess that's OK.
     if not task.coro.cr_running:
         raise RuntimeError("given task does not match calling coroutine")
-    GLOBAL_RUN_CONTEXT.runner.reschedule(task, outcome.Value("reattaching"))
+    # The task has been sleeping on the token that
+    # temporarily_detach_coroutine_object yielded; wake it through that.
+    token = task._sleeping_on
+    if token is None:
+        raise RuntimeError(
+            f"{task!r} is not blocked in wait_task_rescheduled "
+            "or awaiting a WakeToken",
+        )
+    # The loop only ever binds a task to a WakeToken (Runner._block_task_on),
+    # though the task layer sees it as a CancelTarget.
+    assert isinstance(token, WakeToken)
+    token.reschedule(outcome.Value("reattaching"))
     value = await _async_yield(yield_value)
     assert value == outcome.Value("reattaching")

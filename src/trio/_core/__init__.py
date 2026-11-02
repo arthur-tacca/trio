@@ -18,27 +18,34 @@ from ._exceptions import (
     TrioInternalError,
     WouldBlock,
 )
-from ._ki import currently_ki_protected, disable_ki_protection, enable_ki_protection
-from ._local import RunVar, RunVarToken
-from ._mock_clock import MockClock
 
-# Imports that always exist. The core is layered as nurseries (_run) ->
-# runner (_runner) -> tasks/cancellation (_task); see _task.py.
-from ._run import Nursery, open_nursery, run, start_guest_run
-from ._runner import (
-    RunStatistics,
-    add_instrument,
+# The public wrappers that gen_exports generates for the runner's and the
+# instruments' methods come from their own modules, which sit above the
+# modules they wrap; the wrappers for the platform I/O manager's methods are
+# re-exported by _runner.py, which is what selects the platform's backend.
+from ._generated_instrumentation import add_instrument, remove_instrument
+from ._generated_runner import (
     current_clock,
     current_root_task,
     current_statistics,
     current_time,
     current_trio_token,
-    in_trio_run,
-    notify_closing,
-    remove_instrument,
     reschedule,
     spawn_system_task,
     wait_all_tasks_blocked,
+)
+from ._ki import currently_ki_protected, disable_ki_protection, enable_ki_protection
+from ._local import RunVar, RunVarToken
+from ._mock_clock import MockClock
+
+# Imports that always exist. The core is layered as _run -> _runner ->
+# _traps -> _wake_token -> _task -> _run_context, each importing only from
+# the modules below it; see the module docstring of _task.py.
+from ._run import Nursery, open_nursery, run, start_guest_run
+from ._runner import (
+    RunStatistics,
+    in_trio_run,
+    notify_closing,
     wait_readable,
     wait_writable,
 )
@@ -48,20 +55,18 @@ from ._task import (
     Task,
     TaskStatus,
     add_task_exit_callback,
-    checkpoint,
-    checkpoint_if_cancelled,
     current_effective_deadline,
     current_task,
     in_trio_task,
     remove_task_exit_callback,
 )
 from ._thread_cache import start_thread_soon
-
-# Has to come after the core layers above to resolve a circular import
 from ._traps import (
     Abort,
     RaiseCancelT,
     cancel_shielded_checkpoint,
+    checkpoint,
+    checkpoint_if_cancelled,
     permanently_detach_coroutine_object,
     reattach_detached_coroutine_object,
     temporarily_detach_coroutine_object,

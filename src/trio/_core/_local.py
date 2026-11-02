@@ -44,7 +44,7 @@ class RunVar(Generic[T]):
     def get(self, default: T | type[_NoValue] = _NoValue) -> T:
         """Gets the value of this :class:`RunVar` for the current run call."""
         try:
-            return cast("T", GLOBAL_RUN_CONTEXT.runner._locals[self])
+            return cast("T", GLOBAL_RUN_CONTEXT.run_locals[self])
         except AttributeError:
             raise RuntimeError("Cannot be used outside of a run context") from None
         except KeyError:
@@ -71,7 +71,7 @@ class RunVar(Generic[T]):
 
         # This can't fail, because if we weren't in Trio context then the
         # get() above would have failed.
-        GLOBAL_RUN_CONTEXT.runner._locals[self] = value
+        GLOBAL_RUN_CONTEXT.run_locals[self] = value
         return token
 
     def reset(self, token: RunVarToken[T]) -> None:
@@ -91,9 +91,9 @@ class RunVar(Generic[T]):
         previous = token.previous_value
         try:
             if previous is _NoValue:
-                GLOBAL_RUN_CONTEXT.runner._locals.pop(self)
+                GLOBAL_RUN_CONTEXT.run_locals.pop(self)
             else:
-                GLOBAL_RUN_CONTEXT.runner._locals[self] = previous
+                GLOBAL_RUN_CONTEXT.run_locals[self] = previous
         except AttributeError:
             raise RuntimeError("Cannot be used outside of a run context") from None
 

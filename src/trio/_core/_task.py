@@ -1,22 +1,36 @@
-"""Tasks and cancellation: the bottom layer of Trio's core.
+"""Tasks, cancellation and the scheduler: the bottom layer of Trio's core.
 
-The core is layered as
+The core is layered, top to bottom, as
 
-    nurseries (_run.py)  ->  the runner (_runner.py)  ->  tasks/cancellation (this module)
+    _run.py           nurseries, run() and start_guest_run()
+    _runner.py        the run loop and the per-run objects around it
+    _traps.py         the yield points: checkpoints, detaching, and the
+                      wait_task_rescheduled shim
+    _wake_token.py    WakeToken, what a task sleeps on
+    _task.py          tasks, cancel scopes, deadlines, and the Scheduler
+    _run_context.py   the thread-local record of the current run
 
-Each layer only imports from the ones below it. This module knows nothing
-about the run loop beyond the services the runner publishes through
-``GLOBAL_RUN_CONTEXT`` (the current task, the clock, and the deadline
-registry), and nothing about nurseries except that a Task has one as its
-parent; that reference is only ever used by the layers above.
+with _instrumentation.py standalone below this module. Each module imports
+only from the ones below it, so the runner knows nothing of nurseries,
+and this module nothing of nurseries, wake tokens or the loop: where a
+lower layer has to call up, it does so through a contract defined down
+here that the upper layer implements (`TaskOwner`, `CancelTarget`,
+`LoopWaker`), and a Task's parent nursery is a slot that only the nursery
+layer reads. This module owns the run's task-level state, the `Scheduler`
+(the run queue, the living tasks, the deadlines, the clock and the
+instruments, with spawning and reaping), which the runner creates and
+drives and which every task refers to.
 """
 
 from __future__ import annotations
 
+import functools
 import gc
 import itertools
 import sys
+from collections import deque
 from contextlib import contextmanager
+from contextvars import copy_context
 from heapq import heapify, heappop, heappush
 from math import inf, isnan
 from typing import (
@@ -28,15 +42,13 @@ from typing import (
 )
 
 import attrs
+from outcome import Error
 
-from .. import _core
-from .._util import NoPublicConstructor, final
+from .._util import NoPublicConstructor, coroutine_or_error, final
 from ._concat_tb import concat_tb
 from ._exceptions import Cancelled, CancelReasonLiteral
 from ._ki import enable_ki_protection
 from ._run_context import GLOBAL_RUN_CONTEXT
-from ._traps import cancel_shielded_checkpoint
-from ._wake_token import WakeToken
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup
@@ -45,12 +57,14 @@ if sys.version_info < (3, 11):
 if TYPE_CHECKING:
     import contextvars
     import types
-    from collections.abc import Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator
     from types import TracebackType
 
     from outcome import Outcome
-    from typing_extensions import Self, TypeVar, TypeVarTuple
+    from typing_extensions import Self, TypeVar, TypeVarTuple, Unpack
 
+    from .._abc import Clock
+    from ._instrumentation import Instruments
     from ._run import Nursery
 
     PosArgT = TypeVarTuple("PosArgT")
@@ -67,9 +81,10 @@ RetT = TypeVar("RetT")
 
 
 def _current_time() -> float:
-    # The clock is published by the runner (see setup_runner) so that this
-    # layer doesn't need to know anything else about it.
-    return GLOBAL_RUN_CONTEXT.clock.current_time()
+    # For the cancel scope properties, which can be used from outside any
+    # task: without a task in hand, the clock is reached through the
+    # thread-local.
+    return GLOBAL_RUN_CONTEXT.scheduler.clock.current_time()
 
 
 DEADLINE_HEAP_MIN_PRUNE_THRESHOLD: Final = 1000
@@ -134,10 +149,8 @@ class Deadlines:
     _heap: list[tuple[float, int, CancelScope]] = attrs.Factory(list)
     # Count of active deadlines (those that haven't been changed)
     _active: int = 0
-    # If set, called whenever the next deadline changes; the runner uses this
-    # in guest mode, where it isn't necessarily sitting in its own I/O wait
-    # and so may need to be told to come back and recompute its timeout.
-    on_next_deadline_changed: Callable[[], None] | None = None
+    # Woken whenever the next deadline changes, if set: see LoopWaker.
+    loop_waker: LoopWaker | None = None
 
     def add(self, deadline: float, cancel_scope: CancelScope) -> None:
         heappush(self._heap, (deadline, id(cancel_scope), cancel_scope))
@@ -149,17 +162,14 @@ class Deadlines:
     def change(self, cancel_scope: CancelScope, old: float, new: float) -> None:
         """Move ``cancel_scope``'s registered deadline from ``old`` to ``new``
         (either may be ``inf``, meaning no deadline)."""
-        if self.on_next_deadline_changed is not None:
+        if self.loop_waker is not None:
             old_next_deadline = self.next_deadline()
         if old != inf:
             self.remove(old, cancel_scope)
         if new != inf:
             self.add(new, cancel_scope)
-        if (
-            self.on_next_deadline_changed is not None
-            and old_next_deadline != self.next_deadline()
-        ):
-            self.on_next_deadline_changed()
+        if self.loop_waker is not None and old_next_deadline != self.next_deadline():
+            self.loop_waker.wake()
 
     def next_deadline(self) -> float:
         while self._heap:
@@ -471,6 +481,10 @@ class CancelScope:
 
     _cancel_status: CancelStatus | None = attrs.field(default=None, init=False)
     _has_been_entered: bool = attrs.field(default=False, init=False)
+    # The run's deadline registry, from the task that entered the scope;
+    # None before entering and after exiting, when there's nothing to
+    # register.
+    _deadlines: Deadlines | None = attrs.field(default=None, init=False)
     _registered_deadline: float = attrs.field(default=inf, init=False)
     _cancel_called: bool = attrs.field(default=False, init=False)
     cancelled_caught: bool = attrs.field(default=False, init=False)
@@ -500,12 +514,13 @@ class CancelScope:
 
     @enable_ki_protection
     def __enter__(self) -> Self:
-        task = _core.current_task()
+        task = current_task()
         if self._has_been_entered:
             raise RuntimeError(
                 "Each CancelScope may only be used for a single 'with' block",
             )
         self._has_been_entered = True
+        self._deadlines = task._scheduler.deadlines
 
         if self._relative_deadline != inf:
             assert self._deadline == inf
@@ -586,6 +601,7 @@ class CancelScope:
         self._cancel_status.close()
         with self._might_change_registered_deadline():
             self._cancel_status = None
+        self._deadlines = None
         return exc
 
     @enable_ki_protection
@@ -659,7 +675,10 @@ class CancelScope:
                 new = self._deadline
             if old != new:
                 self._registered_deadline = new
-                GLOBAL_RUN_CONTEXT.deadlines.change(self, old, new)
+                # Only an entered scope can have a registered deadline, and
+                # entering is what gives us the registry.
+                assert self._deadlines is not None
+                self._deadlines.change(self, old, new)
 
     @property
     def deadline(self) -> float:
@@ -816,11 +835,11 @@ class CancelScope:
         cancelled then this method silently does nothing.
         """
         try:
-            current_task = repr(_core.current_task())
+            source_task = repr(current_task())
         except RuntimeError:
-            current_task = None
+            source_task = None
         self._cancel(
-            CancelReason(reason=reason, source="explicit", source_task=current_task)
+            CancelReason(reason=reason, source="explicit", source_task=source_task)
         )
 
     @property
@@ -880,6 +899,83 @@ class TaskStatus(Protocol[StatusT_contra]):
 
 
 ################################################################
+# What the layers above implement for this one
+################################################################
+
+
+class TaskOwner(Protocol):
+    """What a task belongs to, as the runner sees it.
+
+    A task's owner is told when the task has been spawned and when it has
+    finished, and says whether it is still accepting tasks. Normally the
+    owner is the task's nursery; the runner is the owner of the root
+    ("<init>") task, and the main task's owner is a wrapper around its
+    nursery that keeps the task's outcome for `trio.run` to return (see
+    ``_run.py``). Defining the contract down here, in the layer that calls
+    it, is what lets tasks be spawned and reaped without this layer or the
+    runner ever naming a nursery.
+
+    The members are underscore-prefixed because the classes implementing
+    them are public, and the contract is not part of their user-facing API.
+    """
+
+    @property
+    def _closed(self) -> bool:
+        """True once the owner has stopped accepting new tasks."""
+        ...
+
+    def _child_spawned(self, task: Task) -> None:
+        """Called with a newly created task, before the task has run or any
+        instrument has seen it: the owner records it, and puts it under
+        whatever cancel scopes it inherits (for a nursery, by activating
+        the nursery's cancel status for it)."""
+        ...
+
+    def _child_finished(self, task: Task, outcome: Outcome[object]) -> None:
+        """Called once the task's coroutine has finished with ``outcome`` (or
+        the task has been permanently detached), after its exit callbacks
+        have run and it has been removed from its cancel scope and from
+        the set of living tasks."""
+        ...
+
+
+class CancelTarget(Protocol):
+    """What a sleeping task hands a cancellation to: the WakeToken it is
+    awaiting, as this layer sees it.
+
+    When a task's cancel status becomes cancelled while the task is
+    blocked, the task calls ``_request_cancel`` on whatever it is sleeping
+    on, at most once per sleep (``_cancel_requested`` says whether it has).
+    What happens next is the token's business: see WakeToken.on_cancel.
+
+    Like TaskOwner's, the members are underscore-prefixed because WakeToken
+    is public and they are not part of its user-facing API.
+    """
+
+    @property
+    def _cancel_requested(self) -> bool: ...
+
+    def _request_cancel(self, reason: CancelReason) -> None: ...
+
+
+class LoopWaker(Protocol):
+    """How the run loop is told that what it is waiting for has changed.
+
+    The loop sleeps in an I/O wait whose timeout is computed from the next
+    deadline and from whether any task is runnable. Normally neither can
+    change while it sleeps, because every change is made by a task, and
+    tasks only run between waits. In guest mode, though, the wait runs on a
+    worker thread while the host loop's thread can change deadlines and
+    reschedule tasks; so there the deadlines and the run queue are given a
+    waker to call when the next deadline changes or the first task becomes
+    runnable, which makes the loop come back and recompute its timeout. (In
+    normal mode they have none.) The runner implements it: see Runner.wake.
+    """
+
+    def wake(self) -> None: ...
+
+
+################################################################
 # Task and friends
 ################################################################
 
@@ -887,7 +983,12 @@ class TaskStatus(Protocol[StatusT_contra]):
 @final
 @attrs.define(eq=False, repr=False)
 class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
-    _parent_nursery: Nursery | None
+    # Who the task reports to; see TaskOwner.
+    _owner: TaskOwner
+    # The run the task belongs to, for it and for anything it blocks on or
+    # enters to reach the run queue, the deadlines and the clock without the
+    # thread-local; see Scheduler.
+    _scheduler: Scheduler
     coro: types.CoroutineType[Any, Outcome[object], Any]  # type: ignore[explicit-any]
     name: str
     context: contextvars.Context
@@ -904,15 +1005,19 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
     #   it should be written in C if you don't want to pollute Trio
     #   tracebacks with extraneous frames.
     # - for scheduled tasks, custom_sleep_data is None
-    # - _sleeping_on is the WakeToken the task is blocked on (directly, or
-    #   via wait_task_rescheduled), or None once it has been rescheduled
+    # - _sleeping_on is what the task is blocked on (a WakeToken, awaited
+    #   directly or via wait_task_rescheduled), seen as the CancelTarget it
+    #   is to this layer, or None once the task has been rescheduled
     # Tasks start out unscheduled.
     _next_send_fn: Callable[[Any], object] | None = None  # type: ignore[explicit-any]
     _next_send: Outcome[Any] | BaseException | None = None  # type: ignore[explicit-any]
-    _sleeping_on: WakeToken[Any, Any] | None = None  # type: ignore[explicit-any]
+    _sleeping_on: CancelTarget | None = None
     custom_sleep_data: Any = None  # type: ignore[explicit-any]
 
-    # For introspection and nursery.start()
+    # The nurseries this task is in and contains. These are for introspection
+    # and nursery.start(): only the nursery layer reads them (this layer and
+    # the runner report to the owner, above, instead). None for the root task.
+    _parent_nursery: Nursery | None = None
     _child_nurseries: list[Nursery] = attrs.Factory(list)
     _eventual_parent_nursery: Nursery | None = None
 
@@ -1029,11 +1134,11 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
                 self._attempt_delivery_of_any_pending_cancel()
 
     def _attempt_delivery_of_any_pending_cancel(self) -> None:
-        # If the task is sleeping, hand the cancellation to the WakeToken it's
-        # sleeping on. Its on_cancel either delivers it (by rescheduling the
-        # token with it), or declines, in which case the token will be
-        # rescheduled by "someone" later. Either way, we only request
-        # cancellation once per blocking call.
+        # If the task is sleeping, hand the cancellation to the token it's
+        # sleeping on (see CancelTarget). Its on_cancel either delivers it
+        # (by rescheduling the token with it), or declines, in which case the
+        # token will be rescheduled by "someone" later. Either way, we only
+        # request cancellation once per blocking call.
         token = self._sleeping_on
         if token is None or token._cancel_requested:
             return
@@ -1044,6 +1149,173 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
         if reason is None:
             reason = CancelReason(source="unknown", reason="misnesting")
         token._request_cancel(reason)
+
+
+################################################################
+# The scheduler
+################################################################
+
+
+@attrs.define(eq=False)
+class Scheduler:
+    """The run's task-level state: the run queue and the set of living
+    tasks, the deadlines, the clock and the instruments, plus spawning and
+    reaping tasks.
+
+    There is one per run. The runner (``_runner.py``) creates it and drives
+    it: the loop that takes tasks off the run queue and waits for I/O lives
+    there. Every task refers to its run's scheduler (``Task._scheduler``),
+    so that a task, a cancel scope entered in it, a WakeToken it sleeps on
+    or a nursery it opened can reach the run without going through the
+    thread-local ``GLOBAL_RUN_CONTEXT``.
+    """
+
+    clock: Clock
+    deadlines: Deadlines
+    instruments: Instruments
+    # The context that system tasks start from.
+    system_context: contextvars.Context
+    run_queue: deque[Task] = attrs.Factory(deque)
+    tasks: set[Task] = attrs.Factory(set)
+    # Woken when the first task becomes runnable, if set: see LoopWaker.
+    loop_waker: LoopWaker | None = None
+    # If the run goes idle for this long (in real seconds), the loop calls
+    # clock._autojump(). Set by MockClock (its autojump_threshold) and read
+    # by the loop: the one piece of the loop's idle handling that lives
+    # outside the loop, here so that the clock needn't know the runner.
+    clock_autojump_threshold: float = inf
+
+    def spawn(
+        self,
+        async_fn: Callable[[Unpack[PosArgT]], Awaitable[object]],
+        args: tuple[Unpack[PosArgT]],
+        owner: TaskOwner,
+        name: object,
+        *,
+        system_task: bool = False,
+        context: contextvars.Context | None = None,
+    ) -> Task:
+        ######
+        # Make sure the owner is in working order
+        ######
+
+        if owner._closed:
+            raise RuntimeError("Nursery is closed to new arrivals")
+
+        ######
+        # Propagate contextvars
+        ######
+        if context is None:
+            context = self.system_context.copy() if system_task else copy_context()
+
+        ######
+        # Call the function and get the coroutine object, while giving helpful
+        # errors for common mistakes.
+        ######
+        # TypeVarTuple passed into ParamSpec function confuses Mypy.
+        coro = context.run(coroutine_or_error, async_fn, *args)  # type: ignore[arg-type]
+
+        if name is None:
+            name = async_fn
+        if isinstance(name, functools.partial):
+            name = name.func
+        if not isinstance(name, str):
+            try:
+                name = f"{name.__module__}.{name.__qualname__}"  # type: ignore[attr-defined]
+            except AttributeError:
+                name = repr(name)
+
+        # very old Cython versions (<0.29.24) has the attribute, but with a value of None
+        if getattr(coro, "cr_frame", None) is None:
+            # This async function is implemented in C or Cython
+            async def python_wrapper(orig_coro: Awaitable[RetT]) -> RetT:
+                return await orig_coro
+
+            coro = python_wrapper(coro)
+        assert coro.cr_frame is not None, "Coroutine frame should exist"  # type: ignore[attr-defined]
+
+        ######
+        # Set up the Task object
+        ######
+        task = Task._create(
+            coro=coro,
+            owner=owner,
+            scheduler=self,
+            name=name,
+            context=context,
+            ki_protected=system_task,
+        )
+
+        self.tasks.add(task)
+        owner._child_spawned(task)
+
+        if "task_spawned" in self.instruments:
+            self.instruments.call("task_spawned", task)
+        # Special case: normally next_send should be an Outcome, but for the
+        # very first send we have to send a literal unboxed None.
+        self.enqueue(task, None)
+        return task
+
+    def enqueue(
+        self,
+        task: Task,
+        next_send: Outcome[object] | BaseException | None,
+    ) -> None:
+        # Make a task runnable, sending it next_send when it next runs. This
+        # is the low-level operation behind WakeToken.reschedule(): anything
+        # that wakes a sleeping task goes through its token (reschedule()
+        # included), so that the token's bookkeeping stays in step. The other
+        # callers here are starting a task, or waking one that isn't sleeping
+        # on a token at all.
+        assert task._next_send_fn is None
+        task._next_send_fn = task.coro.send
+        task._next_send = next_send
+        task._sleeping_on = None
+        task.custom_sleep_data = None
+        if not self.run_queue and self.loop_waker is not None:
+            self.loop_waker.wake()
+        self.run_queue.append(task)
+        if "task_scheduled" in self.instruments:
+            self.instruments.call("task_scheduled", task)
+
+    def task_exited(self, task: Task, outcome: Outcome[object]) -> None:
+        # Run the task's exit callbacks (see add_task_exit_callback). Setting
+        # the list to None first is what marks the task as exited.
+        exit_callbacks = task._exit_callbacks
+        task._exit_callbacks = None
+        assert exit_callbacks is not None
+        for callback in exit_callbacks:
+            callback(task)
+
+        if (
+            task._cancel_status is not None
+            and task._cancel_status.abandoned_by_misnesting
+            and task._cancel_status.parent is None
+        ):
+            # The cancel scope surrounding this task's nursery was closed
+            # before the task exited. Force the task to exit with an error,
+            # since the error might not have been caught elsewhere. See the
+            # comments in CancelStatus.close(). (The matching check for a
+            # nursery that the task left open is made by the nursery that
+            # owns the task, in the layer that knows what a nursery is.)
+            try:
+                # Raise this, rather than just constructing it, to get a
+                # traceback frame included
+                raise RuntimeError(
+                    "Cancel scope stack corrupted: Cancel scope surrounding "
+                    f"{task!r} was closed before the task exited\n{MISNESTING_ADVICE}",
+                )
+            except RuntimeError as new_exc:
+                if isinstance(outcome, Error):
+                    new_exc.__context__ = outcome.error
+                outcome = Error(new_exc)
+
+        task._activate_cancel_status(None)
+        self.tasks.remove(task)
+        task._owner._child_finished(task, outcome)
+
+        if "task_exited" in self.instruments:
+            self.instruments.call("task_exited", task)
 
 
 ################################################################
@@ -1147,58 +1419,6 @@ def current_effective_deadline() -> float:
 
     """
     return current_task()._cancel_status.effective_deadline()
-
-
-async def checkpoint() -> None:
-    """A pure :ref:`checkpoint <checkpoints>`.
-
-    This checks for cancellation and allows other tasks to be scheduled,
-    without otherwise blocking.
-
-    Note that the scheduler has the option of ignoring this and continuing to
-    run the current task if it decides this is appropriate (e.g. for increased
-    efficiency).
-
-    Equivalent to ``await trio.sleep(0)`` (which is implemented by calling
-    :func:`checkpoint`.)
-
-    """
-    # The scheduler is what checks timeouts and converts them into
-    # cancellations. So by doing the schedule point first, we ensure that the
-    # cancel point has the most up-to-date info.
-    await cancel_shielded_checkpoint()
-    task = current_task()
-    task._cancel_points += 1
-    if task._cancel_status.effectively_cancelled:
-        cs = CancelScope(deadline=-inf)
-        assert task._cancel_status._scope._cancel_reason is not None
-        cs._cancel_reason = task._cancel_status._scope._cancel_reason
-        with cs:
-            # Nothing to clean up on cancellation: on_cancel just delivers it.
-            token = WakeToken(WakeToken.reschedule_cancelled)
-            await token
-
-
-async def checkpoint_if_cancelled() -> None:
-    """Issue a :ref:`checkpoint <checkpoints>` if the calling context has been
-    cancelled.
-
-    Equivalent to (but potentially more efficient than)::
-
-        if trio.current_effective_deadline() == -inf:
-            await trio.lowlevel.checkpoint()
-
-    This is either a no-op, or else it allow other tasks to be scheduled and
-    then raises :exc:`trio.Cancelled`.
-
-    Typically used together with :func:`cancel_shielded_checkpoint`.
-
-    """
-    task = current_task()
-    if task._cancel_status.effectively_cancelled:
-        await _core.checkpoint()
-        raise AssertionError("this should never happen")  # pragma: no cover
-    task._cancel_points += 1
 
 
 def in_trio_task() -> bool:

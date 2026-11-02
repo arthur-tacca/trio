@@ -1,7 +1,6 @@
 import time
 from math import inf
 
-from .. import _core
 from .._abc import Clock
 from .._util import final
 from ._run_context import GLOBAL_RUN_CONTEXT
@@ -105,28 +104,30 @@ class MockClock(Clock):
         self._autojump_threshold = float(new_autojump_threshold)
         self._try_resync_autojump_threshold()
 
-    # runner.clock_autojump_threshold is an internal API that isn't easily
-    # usable by custom third-party Clock objects. If you need access to this
-    # functionality, let us know, and we'll figure out how to make a public
-    # API. Discussion:
+    # The scheduler's clock_autojump_threshold is an internal API that isn't
+    # easily usable by custom third-party Clock objects. If you need access
+    # to this functionality, let us know, and we'll figure out how to make a
+    # public API. Discussion:
     #
     #     https://github.com/python-trio/trio/issues/1587
     def _try_resync_autojump_threshold(self) -> None:
         try:
-            runner = GLOBAL_RUN_CONTEXT.runner
-            if runner.is_guest:
-                runner.force_guest_tick_asap()
+            scheduler = GLOBAL_RUN_CONTEXT.scheduler
         except AttributeError:
-            pass
-        else:
-            if runner.clock is self:
-                runner.clock_autojump_threshold = self._autojump_threshold
+            # Not inside a run: the threshold is picked up by start_clock().
+            return
+        if scheduler.loop_waker is not None:
+            # Guest mode: the loop's timeout depends on the threshold, so it
+            # has to come back and recompute it (see LoopWaker in _task.py).
+            scheduler.loop_waker.wake()
+        if scheduler.clock is self:
+            scheduler.clock_autojump_threshold = self._autojump_threshold
 
-    # Invoked by the run loop when runner.clock_autojump_threshold is
-    # exceeded.
+    # Invoked by the run loop when the scheduler's clock_autojump_threshold
+    # is exceeded.
     def _autojump(self) -> None:
-        statistics = _core.current_statistics()
-        jump = statistics.seconds_to_next_deadline
+        deadlines = GLOBAL_RUN_CONTEXT.scheduler.deadlines
+        jump = deadlines.next_deadline() - self.current_time()
         if 0 < jump < inf:
             self.jump(jump)
 

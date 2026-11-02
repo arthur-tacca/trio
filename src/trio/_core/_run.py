@@ -29,6 +29,7 @@ from ._runner import (
     unrolled_run,
 )
 from ._task import (
+    MISNESTING_ADVICE,
     NONSTRICT_EXCEPTIONGROUP_NOTE,
     CancelReason,
     CancelScope,
@@ -101,6 +102,7 @@ class _TaskStatus(TaskStatus[StatusT]):
         tasks = self._old_nursery._children
         self._old_nursery._children = set()
         for task in tasks:
+            task._owner = self._new_nursery
             task._parent_nursery = self._new_nursery
             task._eventual_parent_nursery = None
             self._new_nursery._children.add(task)
@@ -246,6 +248,34 @@ def _cancel_ignored(token: WakeToken[RetT]) -> None:
     """A WakeToken on_cancel callback that declines to deliver the cancellation."""
 
 
+def _abandon_open_nurseries(task: Task, outcome: Outcome[object]) -> Outcome[object]:
+    """Deal with ``task`` having exited while still inside one or more of
+    its nurseries' ``async with`` blocks (nursery misnesting, see
+    MISNESTING_ADVICE).
+
+    Nothing can wait for those nurseries' children any more, so they are
+    cancelled and closed, and the task's outcome is replaced with an error
+    reporting the misnesting, which might not have been caught anywhere
+    else. (The original error, if any, is chained onto the new one.)
+    Returns ``outcome`` unchanged if the task left no nursery open.
+    """
+    if not task._child_nurseries:
+        return outcome
+    for nursery in task._child_nurseries:
+        nursery._parent_task_exited(task)
+    try:
+        # Raise this, rather than just constructing it, to get a traceback
+        # frame included
+        raise RuntimeError(
+            f"Nursery stack corrupted: Nursery surrounding {task!r} was "
+            f"closed before the task exited\n{MISNESTING_ADVICE}",
+        )
+    except RuntimeError as new_exc:
+        if isinstance(outcome, Error):
+            new_exc.__context__ = outcome.error
+        return Error(new_exc)
+
+
 @final
 class Nursery(metaclass=NoPublicConstructor):
     """A context which may be used to spawn (or cancel) child tasks.
@@ -308,18 +338,43 @@ class Nursery(metaclass=NoPublicConstructor):
         "(`~trio.lowlevel.Task`):  The Task that opened this nursery."
         return self._parent_task
 
-    # The next three methods are the whole of what the runner needs from a
-    # nursery (besides reading ``_closed``): see Runner.spawn_impl and
-    # Runner.task_exited.
+    # A nursery is the TaskOwner (see _task.py) of its children: _closed,
+    # _child_spawned and _child_finished are the whole of what the runner
+    # needs from it.
 
     def _child_spawned(self, task: Task) -> None:
         self._children.add(task)
+        task._parent_nursery = self
         task._activate_cancel_status(self._cancel_status)
+
+    def _child_finished(self, task: Task, outcome: Outcome[object]) -> None:
+        self._record_child_finished(task, _abandon_open_nurseries(task, outcome))
+
+    def _record_child_finished(self, task: Task, outcome: Outcome[object]) -> None:
+        # The bookkeeping half of _child_finished: forget the child, keep its
+        # error (if any) for __aexit__ to raise, and see whether that was the
+        # last thing we were waiting for. The main task's owner calls this
+        # directly, having dealt with the task's outcome itself.
+        self._children.remove(task)
+        if self._closed and not hasattr(self, "_pending_excs"):
+            # We're abandoned by misnested nurseries, the result of the task is lost.
+            return
+        if isinstance(outcome, Error):
+            self._add_exc(
+                outcome.error,
+                CancelReason(
+                    source="nursery",
+                    source_task=repr(task),
+                    reason=f"child task raised exception {outcome.error!r}",
+                ),
+            )
+        self._check_nursery_closed()
 
     def _parent_task_exited(self, task: Task) -> None:
         # Our parent task exited without leaving our 'async with' block
         # first. Nothing can wait for our children any more, so cancel them
-        # and close up; the runner raises the misnesting error itself.
+        # and close up; _abandon_open_nurseries() raises the misnesting
+        # error.
         self.cancel_scope._cancel(
             CancelReason(
                 source="nursery",
@@ -340,26 +395,6 @@ class Nursery(metaclass=NoPublicConstructor):
             if token is not None:
                 self._parent_aexit_token = None
                 token.reschedule()
-
-    def _child_finished(
-        self,
-        task: Task,
-        outcome: Outcome[object],
-    ) -> None:
-        self._children.remove(task)
-        if self._closed and not hasattr(self, "_pending_excs"):
-            # We're abandoned by misnested nurseries, the result of the task is lost.
-            return
-        if isinstance(outcome, Error):
-            self._add_exc(
-                outcome.error,
-                CancelReason(
-                    source="nursery",
-                    source_task=repr(task),
-                    reason=f"child task raised exception {outcome.error!r}",
-                ),
-            )
-        self._check_nursery_closed()
 
     async def _nested_child_finished(
         self,
@@ -460,7 +495,7 @@ class Nursery(metaclass=NoPublicConstructor):
                           (i.e. its ``async with`` block has
                           exited).
         """
-        GLOBAL_RUN_CONTEXT.runner.spawn_impl(async_fn, args, self, name)
+        self._parent_task._scheduler.spawn(async_fn, args, self, name)
 
     # Typing changes blocked by https://github.com/python/mypy/pull/17512
     async def start(  # type: ignore[explicit-any]
@@ -524,7 +559,7 @@ class Nursery(metaclass=NoPublicConstructor):
                         self,
                     )
                     thunk = functools.partial(async_fn, task_status=task_status)
-                    task = GLOBAL_RUN_CONTEXT.runner.spawn_impl(
+                    task = self._parent_task._scheduler.spawn(
                         thunk,
                         args,
                         old_nursery,
@@ -556,6 +591,34 @@ class Nursery(metaclass=NoPublicConstructor):
         assert not self._children
 
 
+@final
+class _MainTaskOwner:
+    """The main task's TaskOwner (see _task.py): its nursery, except that the
+    task's outcome is kept for `run` to return (or raise), rather than being
+    raised into the nursery as a child's error normally would be.
+
+    The nursery is told that the task finished normally, so that it closes
+    as usual. Capturing the outcome here, rather than by wrapping
+    ``async_fn`` in a coroutine that captures it, keeps an extra frame out
+    of every traceback that passes through the main task.
+    """
+
+    def __init__(self, runner: Runner, nursery: Nursery) -> None:
+        self._runner = runner
+        self._nursery = nursery
+
+    @property
+    def _closed(self) -> bool:
+        return self._nursery._closed
+
+    def _child_spawned(self, task: Task) -> None:
+        self._nursery._child_spawned(task)
+
+    def _child_finished(self, task: Task, outcome: Outcome[object]) -> None:
+        self._runner.main_task_outcome = _abandon_open_nurseries(task, outcome)
+        self._nursery._record_child_finished(task, Value(None))
+
+
 ################################################################
 # run
 ################################################################
@@ -577,16 +640,16 @@ async def init(
             with CancelScope() as runner.main_task_scope:
                 async with open_nursery() as main_task_nursery:
                     try:
-                        runner.main_task = runner.spawn_impl(
+                        runner.main_task = runner.scheduler.spawn(
                             async_fn,
                             args,
-                            main_task_nursery,
+                            _MainTaskOwner(runner, main_task_nursery),
                             None,
                         )
                     except BaseException as exc:
                         runner.main_task_outcome = Error(exc)
                         return
-                    runner.spawn_impl(
+                    runner.scheduler.spawn(
                         runner.entry_queue.task,
                         (),
                         run_sync_soon_nursery,
@@ -841,10 +904,12 @@ def start_guest_run(  # type: ignore[explicit-any]
         restrict_keyboard_interrupt_to_checkpoints,
         strict_exception_groups,
     )
-    runner.is_guest = True
-    # In guest mode the run loop isn't necessarily waiting in its own I/O
-    # call, so it has to be told when a deadline change needs a new timeout.
-    runner.deadlines.on_next_deadline_changed = runner.force_guest_tick_asap
+    # In guest mode the loop's I/O wait runs on a worker thread while the host
+    # loop's thread can change deadlines and reschedule tasks, so the deadlines
+    # and the run queue need a LoopWaker (see _task.py) to tell the loop to
+    # come back and recompute its timeout: the runner is that waker.
+    runner.scheduler.deadlines.loop_waker = runner
+    runner.scheduler.loop_waker = runner
     runner.guest_tick_scheduled = True
 
     if run_sync_soon_not_threadsafe is None:

@@ -9,7 +9,6 @@ import outcome
 from .._util import final
 from ._exceptions import Cancelled
 from ._ki import enable_ki_protection
-from ._run_context import GLOBAL_RUN_CONTEXT
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -238,7 +237,7 @@ class WakeToken(Generic[T, D]):
         if self._rescheduled:
             raise RuntimeError("WakeToken.reschedule() called more than once")
         self._rescheduled = True
-        GLOBAL_RUN_CONTEXT.runner._enqueue(self._task, to_send)
+        self._task._scheduler.enqueue(self._task, to_send)
 
     def get_cancelled_exception(self) -> Cancelled:
         """Create the :exc:`~trio.Cancelled` for the pending cancellation, to

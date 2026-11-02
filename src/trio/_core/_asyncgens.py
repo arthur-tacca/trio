@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING, NoReturn, TypeVar
 
 import attrs
 
-from .. import _core
 from .._util import name_asyncgen
+from ._ki import disable_ki_protection, enable_ki_protection
 from ._run_context import GLOBAL_RUN_CONTEXT
+from ._task import CancelScope, current_task
 from ._wake_token import WakeToken
 
 # Used to log exceptions in async generator finalizers
@@ -35,7 +36,7 @@ else:
 _R = TypeVar("_R")
 
 
-@_core.disable_ki_protection
+@disable_ki_protection
 def _call_without_ki_protection(
     f: Callable[_P, _R],
     /,
@@ -101,7 +102,7 @@ class AsyncGenerators:
                 # have hit it.
                 self.trailing_needs_finalize.add(agen)
 
-        @_core.enable_ki_protection
+        @enable_ki_protection
         def finalizer(agen: AsyncGeneratorType[object, NoReturn]) -> None:
             try:
                 self.foreign.remove(id(agen))
@@ -165,8 +166,8 @@ class AsyncGenerators:
         # The only tasks running at this point are init and
         # the run_sync_soon task, and since the system nursery is closed,
         # there's no way for user code to spawn more.
-        assert _core.current_task() is runner.init_task
-        assert len(runner.tasks) == 2
+        assert current_task() is runner.init_task
+        assert len(runner.scheduler.tasks) == 2
 
         # To make async generator finalization easier to reason
         # about, we'll shut down asyncgen garbage collection by turning
@@ -233,7 +234,7 @@ class AsyncGenerators:
             # This shield ensures that finalize_asyncgen never exits
             # with an exception, not even a Cancelled. The inside
             # is cancelled so there's no deadlock risk.
-            with _core.CancelScope(shield=True) as cancel_scope:
+            with CancelScope(shield=True) as cancel_scope:
                 cancel_scope.cancel(
                     reason="disallow async work when closing async generators during trio shutdown"
                 )

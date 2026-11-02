@@ -350,7 +350,7 @@ def test_warn_set_wakeup_fd_overwrite() -> None:
 def test_host_wakeup_doesnt_trigger_wait_all_tasks_blocked() -> None:
     # This is designed to hit the branch in unrolled_run where:
     #   idle_primed=True
-    #   runner.runq is empty
+    #   the run queue is empty
     #   events is Truth-y
     # ...and confirm that in this case, wait_all_tasks_blocked does not get
     # triggered.
@@ -584,7 +584,10 @@ def test_guest_mode_internal_errors(
     with monkeypatch.context() as m:
 
         async def crash_in_run_loop(in_host: InHost) -> None:
-            m.setattr("trio._core._run_context.GLOBAL_RUN_CONTEXT.runner.runq", "HI")
+            m.setattr(
+                "trio._core._run_context.GLOBAL_RUN_CONTEXT.runner.scheduler.run_queue",
+                "HI",
+            )
             await trio.sleep(1)
 
         with pytest.raises(trio.TrioInternalError):

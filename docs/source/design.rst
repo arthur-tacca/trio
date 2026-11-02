@@ -473,23 +473,47 @@ The ``_ki.py`` module implements the core infrastructure for safe handling
 of :class:`KeyboardInterrupt`.  It's largely independent of the rest of Trio,
 and could (possibly should?) be extracted into its own independent package.
 
-The heart of the core is split into three layers, each of which only
-imports from the ones below it:
+The heart of the core is split into layers, each of which only imports
+from the ones below it. From the bottom up:
+
+* ``_run_context.py`` is the per-thread record of the run in progress:
+  the current task and the runner, plus the two services published for
+  the modules below the runner that have no task to go through (the
+  scheduler, for the clock and for what :class:`~trio.testing.MockClock`
+  needs, and the run-local values behind :class:`~trio.lowlevel.RunVar`).
+  The synchronous public accessors (:func:`~trio.lowlevel.current_task`,
+  :func:`trio.current_time`, and so on) read it, since a coroutine has
+  no other way to find its task; everything else reaches the run
+  through the task.
 
 * ``_task.py`` defines :class:`~trio.lowlevel.Task`, cancel scopes and
-  the deadline bookkeeping, plus the checkpoint functions. It knows
-  nothing about the run loop beyond a few services the runner publishes
-  through the per-thread run context (the current task, the clock, and
-  the deadline registry).
+  the deadline bookkeeping, and the ``Scheduler``: the run queue, the
+  set of living tasks, the deadlines, the clock and the instruments,
+  with spawning and reaping. Every task refers to its run's scheduler,
+  which is how a cancel scope, a nursery or a wake token reaches the
+  run. Where this layer has to call up into a layer above, it does so
+  through a contract it defines itself and the upper layer implements:
+  a ``TaskOwner`` (a nursery, usually) is told when a task is spawned
+  and when it finishes; a ``CancelTarget`` (a wake token) is handed the
+  cancellation of a sleeping task; a ``LoopWaker`` (the runner, in guest
+  mode) is told that the run loop's timeout has to be recomputed.
 
-* ``_runner.py`` holds the scheduler state and the run loop. It knows
-  about tasks and cancel scopes, but not about nurseries: the init task
-  that sets up a run's nurseries is handed to it by the layer above,
-  and it only ever reaches a task's parent nursery through a couple of
-  methods.
+* ``_wake_token.py`` defines :class:`~trio.lowlevel.WakeToken`, the one
+  thing a task ever sleeps on, and ``_traps.py`` the functions that yield
+  to the run loop: the checkpoints, the detaching functions, and the
+  :func:`~trio.lowlevel.wait_task_rescheduled` shim over wake tokens.
+
+* ``_runner.py`` holds the run loop and the per-run objects around it
+  (the I/O manager, the entry queue, the clock, the instruments). It
+  drives the scheduler, and knows about tasks and cancel scopes, but
+  not about nurseries: the init task that sets up a run's nurseries is
+  handed to it by the layer above, and the runner itself is the
+  ``TaskOwner`` of that root task.
 
 * ``_run.py`` builds nurseries on top of the runner, and provides
   :func:`trio.run` and :func:`trio.lowlevel.start_guest_run`.
+
+``_instrumentation.py`` stands on its own below all of these.
 
 The one thing that *isn't* in these modules is I/O handling. This is
 delegated to an ``IOManager`` class, of which there are currently
