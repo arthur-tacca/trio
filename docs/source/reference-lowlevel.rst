@@ -1060,8 +1060,8 @@ for running there, with some big restrictions:
   tasks with `TrioToken.run_sync_soon`, or by directly calling
   synchronous Trio functions like `trio.Event.set`. And the
   ``trio.pyodide`` module, described below, lets Trio tasks wait for
-  JavaScript promises, and make HTTP requests with the browser's
-  ``fetch``.
+  JavaScript promises, make HTTP requests with the browser's
+  ``fetch``, and open WebSocket connections with its ``WebSocket``.
 
 **Starting Trio:** ``trio.pyodide.run(async_fn, *args)`` is the
 counterpart of `trio.run`. It runs ``async_fn(*args)`` as the main task
@@ -1194,6 +1194,54 @@ passed through to ``fetch`` as request options, such as
 ``credentials="include"``. Network failures are raised as
 ``pyodide.ffi.JsException``. Once a request has been aborted, reading
 anything more from it raises `~trio.BrokenResourceError`.
+
+**WebSockets:** ``trio.pyodide.connect_websocket(uri, *,
+subprotocols=None, open_timeout=10, close_timeout=10)`` connects to a
+WebSocket server with the browser's ``WebSocket``. It's an async
+context manager that gives you a ``trio.pyodide.WebSocketConnection``,
+and closes it when the block exits::
+
+   async with trio.pyodide.connect_websocket("wss://example.com/chat") as ws:
+       await ws.send("hello")        # a str is sent as a text message,
+       await ws.send(b"\x00\x01")    # and bytes as a binary one
+       reply = await ws.recv()       # a str or bytes, likewise
+       async for message in ws:      # until the connection is closed
+           ...
+
+Once the connection has closed, and whatever arrived before that has
+been received, ``recv`` and ``send`` raise
+``trio.pyodide.ConnectionClosed``: its subclass ``ConnectionClosedOK``
+after a normal closure, which is also what ends the ``async for``, and
+``ConnectionClosedError`` otherwise. The exception's ``code`` and
+``reason`` come from the server's close frame, and stay available as
+the connection's ``close_code`` and ``close_reason``. To close it
+yourself, ``await ws.aclose(code=1000, reason="")``; browsers only let
+a script use the code 1000, or one from 3000 to 4999. If the connection
+can't be made, ``connect_websocket`` raises
+``trio.pyodide.InvalidHandshake`` (browsers don't tell scripts why;
+look in their console), or `TimeoutError` after ``open_timeout``
+seconds.
+
+Cancellation does what you'd want. Cancelling the wait for a
+connection abandons the attempt. Cancelling ``recv`` loses nothing: the
+next call gets the next message. ``send`` hands the browser a whole
+message at once, after waiting if the browser already has a lot
+queued, so if it's cancelled then nothing was sent. And ``aclose``
+always leaves the connection closed: if the server hasn't completed the
+closing handshake after ``close_timeout`` seconds, or ``aclose`` is
+cancelled, it stops waiting and the connection counts as closed
+abnormally, with close code 1006.
+
+The names and behaviour follow the Trio connection of the `websockets
+<https://websockets.readthedocs.io/>`__ library (``websockets.trio``),
+so that a program can use that library natively and this in a browser.
+It's a subset, because a browser keeps most of the protocol to itself:
+a script can't send or see pings, set HTTP headers, or choose
+extensions and size limits, and it only ever sends and receives whole
+messages. One difference is worth planning for: a browser can't be told
+to stop reading from a WebSocket, so messages that arrive faster than
+you receive them are queued without limit, where ``websockets`` would
+make the server wait.
 
 
 Limitations

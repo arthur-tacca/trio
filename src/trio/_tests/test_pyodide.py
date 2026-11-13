@@ -6,7 +6,7 @@ from __future__ import annotations
 import operator
 import sys
 import types
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
@@ -20,7 +20,7 @@ from trio._core._tests.test_guest_mode_emscripten import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from types import ModuleType
 
 
@@ -152,6 +152,154 @@ class FakePromise:
         trio.lowlevel.current_trio_token().run_sync_soon(deliver)
 
 
+def soon(fn: Callable[[], object]) -> None:
+    """Call fn in a moment, the way a browser delivers events from its loop."""
+    trio.lowlevel.current_trio_token().run_sync_soon(fn)
+
+
+class FakeArrayBuffer:
+    """The data of a binary WebSocket message, as Python sees it."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def to_bytes(self) -> bytes:
+        return self._data
+
+
+class FakeWebSocket:
+    """A JavaScript WebSocket, with the server's part played by the test.
+
+    ``script`` says what happens to each new one: "accept"; "hang" (nothing);
+    "refuse", the way a browser reports a failed connection (an error event,
+    then a close event); "refuse-like-node", the way Node 22 does (an error
+    event with a message, and nothing else); or "accept-and-close".
+    """
+
+    script: ClassVar[str] = "accept"
+    instances: ClassVar[list[FakeWebSocket]] = []
+
+    def __init__(self, url: str, protocols: Sequence[str] = ()) -> None:
+        # Every handler it's ever been given
+        self.handlers_seen: list[FakeProxy] = []
+        self.url = url
+        self.protocols = list(protocols)
+        self.readyState = 0
+        self.protocol = ""
+        self.binaryType = "blob"
+        self.bufferedAmount = 0
+        self.onopen: FakeProxy | None = None
+        self.onmessage: FakeProxy | None = None
+        self.onerror: FakeProxy | None = None
+        self.onclose: FakeProxy | None = None
+        self.sent: list[object] = []
+        self.close_calls: list[tuple[int | None, str | None]] = []
+        self.handlers_at_close: tuple[FakeProxy | None, ...] | None = None
+        self.replies_to_close = True
+        FakeWebSocket.instances.append(self)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name.startswith("on") and value is not None:
+            assert isinstance(value, FakeProxy)
+            self.handlers_seen.append(value)
+        super().__setattr__(name, value)
+
+    @classmethod
+    def new(cls, url: str, protocols: Sequence[str] = ()) -> FakeWebSocket:
+        if "://" not in url:
+            raise FakeJsError(f"The URL '{url}' is invalid.", "SyntaxError")
+        ws = cls(url, protocols)
+        if cls.script != "hang":
+            soon(
+                {
+                    "accept": ws.server_accept,
+                    "refuse": ws.server_lost,
+                    "refuse-like-node": ws.server_refuse_like_node,
+                    "accept-and-close": ws.server_accept_and_close,
+                }[cls.script],
+            )
+        return ws
+
+    @property
+    def handlers(self) -> tuple[FakeProxy | None, ...]:
+        return (self.onopen, self.onmessage, self.onerror, self.onclose)
+
+    def _fire(self, name: str, **attributes: object) -> None:
+        handler = getattr(self, "on" + name)
+        if handler is not None:
+            handler(types.SimpleNamespace(type=name, **attributes))
+
+    # What the page does
+
+    def send(self, data: object) -> None:
+        # A real one throws if it's still connecting, and quietly discards
+        # the data if it's closing or closed. Neither should ever be asked for.
+        assert self.readyState == 1
+        self.sent.append(data)
+
+    def close(self, code: int | None = None, reason: str | None = None) -> None:
+        self.close_calls.append((code, reason))
+        self.handlers_at_close = self.handlers
+        if self.readyState == 0:
+            # This is Node's behaviour, the more awkward one: an error event
+            # from inside close(), and then no close event, ever.
+            self.readyState = 2
+            self._fire(
+                "error",
+                message="Connection was closed before it was established.",
+            )
+        elif self.readyState == 1:
+            self.readyState = 2
+            if self.replies_to_close:
+                # Servers echo the close code and reason
+                soon(
+                    lambda: self.server_close(
+                        1005 if code is None else code,
+                        reason or "",
+                    ),
+                )
+
+    # What the server (or the network) does
+
+    def server_accept(self) -> None:
+        if self.readyState != 0:  # pragma: no cover
+            return
+        self.readyState = 1
+        if self.protocols:
+            self.protocol = self.protocols[-1]
+        self._fire("open")
+
+    def server_send(self, data: str | bytes) -> None:
+        assert self.readyState == 1
+        self._fire(
+            "message",
+            data=data if isinstance(data, str) else FakeArrayBuffer(data),
+        )
+
+    def server_close(
+        self,
+        code: int = 1000,
+        reason: str = "",
+        was_clean: bool = True,
+    ) -> None:
+        self.readyState = 3
+        self._fire("close", code=code, reason=reason, wasClean=was_clean)
+
+    def server_lost(self) -> None:
+        # The connection breaks, or can't be made: an error event that says
+        # nothing, then a close event.
+        self.readyState = 3
+        self._fire("error")
+        self._fire("close", code=1006, reason="", wasClean=False)
+
+    def server_refuse_like_node(self) -> None:
+        self._fire("error", message="Received network error or non-101 status code.")
+
+    def server_accept_and_close(self) -> None:
+        self.server_accept()
+        self.server_close(4000, "busy")
+
+
 def fake_run_js(source: str) -> Callable[..., object]:  # type: ignore[explicit-any]
     """Python stand-ins for the JavaScript helpers trio._pyodide creates."""
     if "controller.abort" in source:
@@ -214,6 +362,7 @@ def trio_pyodide() -> Iterator[ModuleType]:
     fake_js.Error = FakeJsError  # type: ignore[attr-defined]
     fake_js.AbortController = FakeAbortController  # type: ignore[attr-defined]
     fake_js.Promise = FakePromise  # type: ignore[attr-defined]
+    fake_js.WebSocket = FakeWebSocket  # type: ignore[attr-defined]
     fake_pyodide = types.ModuleType("pyodide")
     fake_ffi = types.ModuleType("pyodide.ffi")
     fake_ffi.create_proxy = FakeProxy  # type: ignore[attr-defined]
@@ -739,3 +888,513 @@ async def test_cancel_on_abort_own_deadline(
     assert scope.cancelled_caught
     assert not controller.signal.aborted
     assert controller.signal.listeners == []
+
+
+################################################################
+# connect_websocket
+################################################################
+
+
+@pytest.fixture
+def websockets(monkeypatch: pytest.MonkeyPatch) -> list[FakeWebSocket]:
+    """The fake WebSockets made during the test, which get accepted unless the
+    test changes FakeWebSocket.script."""
+    monkeypatch.setattr(FakeWebSocket, "script", "accept")
+    monkeypatch.setattr(FakeWebSocket, "instances", [])
+    return FakeWebSocket.instances
+
+
+def assert_released(fake: FakeWebSocket) -> None:
+    """The connection has let go of the WebSocket: no event from it can reach
+    Python any more, and its proxies have been destroyed."""
+    assert fake.handlers == (None, None, None, None)
+    assert len(fake.handlers_seen) == 4
+    assert all(handler.destroyed for handler in fake.handlers_seen)
+
+
+async def test_websocket_send_and_recv(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("wss://example.com/chat") as ws:
+        (fake,) = websockets
+        assert fake.url == "wss://example.com/chat"
+        assert fake.protocols == []
+        assert fake.binaryType == "arraybuffer"
+        assert ws.state is trio_pyodide.WebSocketState.OPEN
+        assert ws.subprotocol is None
+        assert ws.close_code is None
+        assert ws.close_reason is None
+        assert repr(ws) == (
+            "<trio.pyodide.WebSocketConnection OPEN 'wss://example.com/chat'>"
+        )
+
+        await ws.send("héllo")
+        await ws.send(b"\x00\xff")
+        await ws.send(bytearray(b"array"))
+        await ws.send(memoryview(b"view"))
+        sent = ["héllo", b"\x00\xff", bytearray(b"array"), memoryview(b"view")]
+        assert fake.sent == sent
+
+        fake.server_send("héllo yourself")
+        fake.server_send(b"\x00\xff")
+        assert await ws.recv() == "héllo yourself"
+        message = await ws.recv()
+        assert isinstance(message, bytes)
+        assert message == b"\x00\xff"
+
+    # Leaving the block closed it, normally
+    assert fake.close_calls == [(1000, "")]
+    assert ws.state is trio_pyodide.WebSocketState.CLOSED
+    assert ws.close_code == 1000
+    assert ws.close_reason == ""
+    assert_released(fake)
+    with pytest.raises(trio_pyodide.ConnectionClosedOK):
+        await ws.recv()
+    with pytest.raises(trio_pyodide.ConnectionClosedOK):
+        await ws.send("too late")
+    assert fake.sent == sent
+
+
+def test_websocket_connection_has_no_public_constructor(
+    trio_pyodide: ModuleType,
+) -> None:
+    with pytest.raises(TypeError, match="no public constructor"):
+        trio_pyodide.WebSocketConnection(object(), 10)
+
+
+async def test_websocket_subprotocols(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket(
+        "ws://example.com",
+        subprotocols=("chat.v1", "chat.v2"),
+    ) as ws:
+        (fake,) = websockets
+        assert fake.protocols == ["chat.v1", "chat.v2"]
+        # The server's choice
+        assert ws.subprotocol == "chat.v2"
+
+    with pytest.raises(TypeError, match="subprotocols must be a sequence"):
+        async with trio_pyodide.connect_websocket(
+            "ws://example.com",
+            subprotocols="chat.v1",
+        ):
+            raise AssertionError("shouldn't connect")  # pragma: no cover
+    assert len(websockets) == 1
+
+
+async def test_websocket_decode_and_text_flags(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        for _ in range(2):
+            fake.server_send("text")
+            fake.server_send(b"binary")
+        assert await ws.recv(decode=False) == b"text"
+        assert await ws.recv(decode=True) == "binary"
+        assert await ws.recv(decode=True) == "text"
+        assert await ws.recv(decode=False) == b"binary"
+
+        await ws.send("as binary", text=False)
+        await ws.send(b"as text", text=True)
+        await ws.send(memoryview(b"view as text"), text=True)
+        await ws.send("text anyway", text=True)
+        await ws.send(b"binary anyway", text=False)
+        assert fake.sent == [
+            b"as binary",
+            "as text",
+            "view as text",
+            "text anyway",
+            b"binary anyway",
+        ]
+        with pytest.raises(TypeError, match="str or bytes-like, not list"):
+            await ws.send(["not", "a", "message"])
+
+
+async def test_websocket_messages_wait_to_be_received(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        expected = [str(i) for i in range(1000)]
+        for message in expected:
+            fake.server_send(message)
+        assert [await ws.recv() for _ in expected] == expected
+
+
+async def test_websocket_recv_cancellation_loses_nothing(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        with trio.move_on_after(1) as scope:
+            await ws.recv()
+        assert scope.cancelled_caught
+        fake.server_send("after the timeout")
+        assert await ws.recv() == "after the timeout"
+
+
+async def test_websocket_iteration(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        fake.server_send("one")
+        fake.server_send(b"two")
+        soon(lambda: fake.server_close(1000, "that's all"))
+        # Ends when the connection is closed normally
+        assert [message async for message in ws] == ["one", b"two"]
+        assert ws.close_code == 1000
+        assert ws.close_reason == "that's all"
+        await ws.wait_closed()
+    # It was closed already, so leaving the block didn't close it again
+    assert fake.close_calls == []
+    assert_released(fake)
+
+
+async def test_websocket_closed_by_server_with_an_error_code(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        fake.server_send("last words")
+        fake.server_close(4001, "go away")
+        assert ws.state is trio_pyodide.WebSocketState.CLOSED
+        assert_released(fake)
+        # What arrived before it closed can still be received
+        assert await ws.recv() == "last words"
+        with pytest.raises(trio_pyodide.ConnectionClosedError) as excinfo:
+            await ws.recv()
+        exc = excinfo.value
+        assert (exc.code, exc.reason, exc.was_clean) == (4001, "go away", True)
+        assert str(exc) == "code 4001 (go away)"
+        assert (ws.close_code, ws.close_reason) == (4001, "go away")
+        with pytest.raises(trio_pyodide.ConnectionClosedError):
+            await ws.send("hello?")
+        with pytest.raises(trio_pyodide.ConnectionClosedError):
+            async for _ in ws:
+                raise AssertionError("no more messages")  # pragma: no cover
+
+
+@pytest.mark.parametrize(
+    ("code", "was_clean", "ok"),
+    [
+        (1000, True, True),  # normal closure
+        (1001, True, True),  # going away
+        (1005, True, True),  # the close frame had no code
+        (1000, False, False),  # ...but the closing handshake didn't complete
+        (1002, True, False),
+        (4000, True, False),
+        (1006, False, False),
+    ],
+)
+async def test_websocket_closed_ok_or_error(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    code: int,
+    was_clean: bool,
+    ok: bool,
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        # A task that's waiting when it happens gets woken
+        soon(lambda: fake.server_close(code, "", was_clean))
+        with pytest.raises(trio_pyodide.ConnectionClosed) as excinfo:
+            await ws.recv()
+        expected = (
+            trio_pyodide.ConnectionClosedOK
+            if ok
+            else trio_pyodide.ConnectionClosedError
+        )
+        assert type(excinfo.value) is expected
+
+
+async def test_websocket_connection_lost(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        fake.server_send("made it")
+        fake.server_lost()
+        assert await ws.recv() == "made it"
+        with pytest.raises(trio_pyodide.ConnectionClosedError) as excinfo:
+            await ws.recv()
+        assert excinfo.value.code == 1006
+        assert not excinfo.value.was_clean
+        assert str(excinfo.value) == "code 1006, without a closing handshake"
+    assert_released(fake)
+
+
+@pytest.mark.parametrize(
+    ("script", "detail"),
+    [
+        ("refuse", ""),
+        ("refuse-like-node", ": Received network error or non-101 status code."),
+    ],
+)
+async def test_websocket_handshake_fails(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    monkeypatch: pytest.MonkeyPatch,
+    script: str,
+    detail: str,
+) -> None:
+    monkeypatch.setattr(FakeWebSocket, "script", script)
+    with pytest.raises(trio_pyodide.InvalidHandshake) as excinfo:
+        async with trio_pyodide.connect_websocket("ws://nowhere.example"):
+            raise AssertionError("shouldn't connect")  # pragma: no cover
+    assert str(excinfo.value) == (
+        "couldn't open a WebSocket connection to 'ws://nowhere.example'" + detail
+    )
+    (fake,) = websockets
+    assert_released(fake)
+
+
+async def test_websocket_invalid_uri(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    # Whatever the browser throws from the constructor comes straight through
+    with pytest.raises(FakeJsError, match="is invalid"):
+        async with trio_pyodide.connect_websocket("not a uri"):
+            raise AssertionError("shouldn't connect")  # pragma: no cover
+    assert websockets == []
+
+
+async def test_websocket_open_timeout(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    monkeypatch: pytest.MonkeyPatch,
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    monkeypatch.setattr(FakeWebSocket, "script", "hang")
+    start = trio.current_time()
+    with pytest.raises(TimeoutError, match="opening handshake"):
+        async with trio_pyodide.connect_websocket(
+            "ws://slow.example",
+            open_timeout=3,
+        ):
+            raise AssertionError("shouldn't connect")  # pragma: no cover
+    assert trio.current_time() - start == 3
+    (fake,) = websockets
+    # The attempt was abandoned by closing the WebSocket, and the handlers
+    # had gone before that could fire anything at them
+    assert fake.close_calls == [(None, None)]
+    assert fake.handlers_at_close == (None, None, None, None)
+    assert_released(fake)
+
+
+async def test_websocket_connect_cancelled(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    monkeypatch: pytest.MonkeyPatch,
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    monkeypatch.setattr(FakeWebSocket, "script", "hang")
+    with trio.move_on_after(30) as scope:
+        async with trio_pyodide.connect_websocket(
+            "ws://slow.example",
+            open_timeout=None,
+        ):
+            raise AssertionError("shouldn't connect")  # pragma: no cover
+    assert scope.cancelled_caught
+    (fake,) = websockets
+    assert fake.close_calls == [(None, None)]
+    assert fake.handlers_at_close == (None, None, None, None)
+    assert_released(fake)
+
+
+async def test_websocket_closed_straight_after_opening(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The handshake succeeded, so this isn't a failure to connect, even
+    # though the connection has already closed by the time we get it
+    monkeypatch.setattr(FakeWebSocket, "script", "accept-and-close")
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        assert ws.state is trio_pyodide.WebSocketState.CLOSED
+        with pytest.raises(trio_pyodide.ConnectionClosedError) as excinfo:
+            await ws.recv()
+        assert (excinfo.value.code, excinfo.value.reason) == (4000, "busy")
+
+
+async def test_websocket_send_waits_for_the_browser(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+
+        # Cancelling a send before it starts sends nothing...
+        with trio.CancelScope() as scope:
+            scope.cancel()
+            await ws.send("cancelled")
+        assert scope.cancelled_caught
+        assert fake.sent == []
+
+        # ...and nor does cancelling one that's waiting for the browser to
+        # get through what it already has queued
+        fake.bufferedAmount = 2**20 + 1
+        with trio.move_on_after(1) as scope:
+            await ws.send("cancelled")
+        assert scope.cancelled_caught
+        assert fake.sent == []
+
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(ws.send, "first")
+            await trio.testing.wait_all_tasks_blocked()
+            nursery.start_soon(ws.send, "second")
+            await trio.testing.wait_all_tasks_blocked()
+            assert fake.sent == []
+            fake.bufferedAmount = 2**20
+        # Once there was room they went, in the order they were asked for
+        assert fake.sent == ["first", "second"]
+
+
+async def test_websocket_send_while_closing(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        # The server has started closing the connection
+        fake.readyState = 2
+        assert ws.state is trio_pyodide.WebSocketState.CLOSING
+
+        async def send_too_late() -> None:
+            # It waits to see how the connection ends, to report that
+            with pytest.raises(trio_pyodide.ConnectionClosedOK):
+                await ws.send("too late")
+
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(send_too_late)
+            await trio.testing.wait_all_tasks_blocked()
+            fake.server_close(1001, "restarting")
+        assert fake.sent == []
+
+
+async def test_websocket_aclose_with_code_and_reason(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        # Browsers refuse these, so we do, before closing anything
+        with pytest.raises(ValueError, match="1000, or a code from 3000 to 4999"):
+            await ws.aclose(1001)
+        with pytest.raises(ValueError, match="at most 123 bytes"):
+            await ws.aclose(reason="é" * 62)
+        assert ws.state is trio_pyodide.WebSocketState.OPEN
+        assert fake.close_calls == []
+
+        reason = "é" * 61
+        await ws.aclose(3001, reason)
+        assert fake.close_calls == [(3001, reason)]
+        assert ws.state is trio_pyodide.WebSocketState.CLOSED
+        assert (ws.close_code, ws.close_reason) == (3001, reason)
+        assert_released(fake)
+        # Closing with a code that isn't one of the normal ones counts as an
+        # error afterwards, as it does in the websockets library
+        with pytest.raises(trio_pyodide.ConnectionClosedError):
+            await ws.recv()
+
+        # Closing again does nothing
+        await ws.aclose()
+        await ws.aclose(4000, "again")
+    assert fake.close_calls == [(3001, reason)]
+
+
+async def test_websocket_aclose_while_server_is_closing(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+        (fake,) = websockets
+        fake.readyState = 2
+        async with trio.open_nursery() as nursery:
+            # The browser ignores our close(), since it's closing already;
+            # we wait for it to finish all the same
+            nursery.start_soon(ws.aclose, 3000, "ours")
+            await trio.testing.wait_all_tasks_blocked()
+            assert fake.close_calls == [(3000, "ours")]
+            assert ws.state is trio_pyodide.WebSocketState.CLOSING
+            fake.server_close(1000, "theirs")
+        # We didn't get to send our code, so it doesn't count against this
+        # being a normal closure
+        with pytest.raises(trio_pyodide.ConnectionClosedOK) as excinfo:
+            await ws.recv()
+        assert excinfo.value.reason == "theirs"
+
+
+async def test_websocket_close_timeout(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    async with trio_pyodide.connect_websocket(
+        "ws://example.com",
+        close_timeout=2,
+    ) as ws:
+        (fake,) = websockets
+        fake.replies_to_close = False
+        start = trio.current_time()
+    assert trio.current_time() - start == 2
+    assert fake.close_calls == [(1000, "")]
+    # The browser is still waiting for the server...
+    assert fake.readyState == 2
+    # ...but we aren't: for us, it has closed abnormally
+    assert ws.state is trio_pyodide.WebSocketState.CLOSED
+    assert (ws.close_code, ws.close_reason) == (1006, "")
+    assert_released(fake)
+    with pytest.raises(trio_pyodide.ConnectionClosedError) as excinfo:
+        await ws.recv()
+    assert not excinfo.value.was_clean
+    # Whatever the browser does with it later doesn't reach us
+    fake.server_close(1000)
+    assert ws.close_code == 1006
+
+
+async def test_websocket_aclose_cancelled(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+    autojump_clock: trio.testing.MockClock,
+) -> None:
+    async with trio_pyodide.connect_websocket(
+        "ws://example.com",
+        close_timeout=None,
+    ) as ws:
+        (fake,) = websockets
+        fake.replies_to_close = False
+        with trio.move_on_after(5) as scope:
+            await ws.aclose()
+        assert scope.cancelled_caught
+        # Like any Trio resource, it's closed regardless
+        assert fake.close_calls == [(1000, "")]
+        assert ws.state is trio_pyodide.WebSocketState.CLOSED
+        assert ws.close_code == 1006
+        assert_released(fake)
+
+
+async def test_websocket_closed_when_the_block_raises(
+    trio_pyodide: ModuleType,
+    websockets: list[FakeWebSocket],
+) -> None:
+    with pytest.raises(KeyError, match="oops"):
+        async with trio_pyodide.connect_websocket("ws://example.com") as ws:
+            raise KeyError("oops")
+    (fake,) = websockets
+    assert fake.close_calls == [(1000, "")]
+    assert ws.state is trio_pyodide.WebSocketState.CLOSED
+    assert_released(fake)

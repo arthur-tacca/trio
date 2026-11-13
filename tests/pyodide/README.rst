@@ -8,11 +8,15 @@ inside `Pyodide <https://pyodide.org/>`__ under Node.js:
   nurseries, cancellation, waking Trio from JavaScript).
 - ``pyodide_test.py``: ``trio.pyodide``, i.e. calling JavaScript async
   functions from Trio, calling Trio from JavaScript, and the ``fetch``-based
-  HTTP client, against a local HTTP server that the runner starts.
+  HTTP client.
+- ``websocket_test.py``: ``trio.pyodide.connect_websocket``.
+
+The last two talk to a local HTTP and WebSocket server, ``test_server.mjs``,
+which the runner starts for them.
 
 They aren't part of the regular test suite. To run them::
 
-    # Pyodide's Node.js package
+    # Pyodide's Node.js package (which brings the "ws" package the server uses)
     npm install pyodide
     # Trio's (pure Python) dependencies, in a directory Pyodide can mount
     python -m pip install --target pyodide-deps attrs sortedcontainers idna outcome sniffio

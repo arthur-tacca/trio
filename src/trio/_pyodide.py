@@ -1,7 +1,8 @@
 """Trio support for Pyodide (Python in the browser): starting a Trio run as a
 guest of the browser's event loop, calling JavaScript async functions from
-Trio tasks, calling Trio async functions from JavaScript, and an HTTP client
-built on the browser's ``fetch``.
+Trio tasks, calling Trio async functions from JavaScript, an HTTP client
+built on the browser's ``fetch``, and a WebSocket client built on the
+browser's ``WebSocket``.
 
 This only works on Emscripten; see the "Running Trio in the browser with
 Pyodide" section of the docs.
@@ -17,10 +18,12 @@ from typing import TYPE_CHECKING
 # for the platform-specific I/O managers; it can't be imported there anyway.
 assert not TYPE_CHECKING or sys.platform == "emscripten"
 
+import enum
 import itertools
 import json
+import math
 import traceback
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Final, NamedTuple
 
 import js
@@ -30,11 +33,18 @@ from pyodide.ffi import JsException, create_proxy, to_js
 
 import trio
 
-from ._abc import ReceiveStream
-from ._util import final
+from ._abc import AsyncResource, ReceiveStream
+from ._util import NoPublicConstructor, final
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+    from collections.abc import (
+        AsyncIterator,
+        Awaitable,
+        Callable,
+        Iterator,
+        Mapping,
+        Sequence,
+    )
 
     from typing_extensions import Self
 
@@ -683,3 +693,433 @@ async def fetch(
         setattr(init, key, value)
     js_response = await _call(js.fetch, None, (url, init), abort_controller)
     return Response(js_response, abort_controller)
+
+
+################################################################
+# WebSockets
+################################################################
+
+# This follows the connection API of the 'websockets' library's Trio
+# implementation (websockets.trio), as far as a browser allows, so that the
+# same program can use that library natively and this module in a browser.
+# It's a parallel implementation rather than a port: the browser does the
+# protocol itself, and only lets a script see whole messages and four events.
+
+# send() waits until the browser has fewer than this many bytes queued before
+# handing it another message. Browsers don't say when their queue drains, so
+# waiting means polling, and a generous mark keeps the polling rare.
+_SEND_HIGH_WATER_MARK: Final = 2**20
+_SEND_POLL_INTERVAL: Final = 0.01
+
+# RFC 6455 close codes. The "OK" ones are normal closure, going away, and the
+# stand-in for a close frame that didn't carry a code; 1006 is the stand-in
+# for a connection that ended without a close frame at all.
+_OK_CLOSE_CODES: Final = frozenset({1000, 1001, 1005})
+_ABNORMAL_CLOSURE: Final = 1006
+
+
+class WebSocketState(enum.IntEnum):
+    """The state of a `WebSocketConnection`. The values are those of a
+    JavaScript ``WebSocket``'s ``readyState``."""
+
+    CONNECTING = 0
+    OPEN = 1
+    CLOSING = 2
+    CLOSED = 3
+
+
+class InvalidHandshake(Exception):
+    """Raised by `connect_websocket` when the connection can't be made: the
+    server couldn't be reached, or it didn't accept the WebSocket handshake.
+
+    Browsers deliberately don't tell scripts which of those it was, or why
+    (their developer console usually does), so there are no details here
+    beyond whatever message the JavaScript runtime offers.
+
+    """
+
+
+class ConnectionClosed(Exception):
+    """Raised when sending to, or receiving from, a `WebSocketConnection`
+    that has been closed. It's always one of the two subclasses,
+    `ConnectionClosedOK` or `ConnectionClosedError`.
+
+    The attributes are what the browser reports when a connection closes:
+
+    * ``code``: the close code from the server's close frame; 1005 if its
+      close frame had none, and 1006 if the connection ended without one
+    * ``reason``: the reason from the server's close frame, often empty
+    * ``was_clean``: whether both sides completed the closing handshake
+
+    """
+
+    def __init__(self, code: int, reason: str, was_clean: bool) -> None:
+        super().__init__(code, reason, was_clean)
+        self.code = code
+        self.reason = reason
+        self.was_clean = was_clean
+
+    def __str__(self) -> str:
+        text = f"code {self.code}"
+        if self.reason:
+            text += f" ({self.reason})"
+        if not self.was_clean:
+            text += ", without a closing handshake"
+        return text
+
+
+class ConnectionClosedOK(ConnectionClosed):
+    """The connection was closed normally: the closing handshake completed,
+    with a close code of 1000 (normal closure) or 1001 (going away), or
+    without one."""
+
+
+class ConnectionClosedError(ConnectionClosed):
+    """The connection was closed with any other close code, or was lost
+    without a closing handshake."""
+
+
+@final
+class WebSocketConnection(AsyncResource, metaclass=NoPublicConstructor):
+    """A WebSocket connection, as made by `connect_websocket`.
+
+    Send messages with `send`, and receive them with `recv` or by iterating
+    over the connection with ``async for``. A message is a `str` (a WebSocket
+    text message) or a `bytes` (a binary one).
+
+    """
+
+    def __init__(self, js_websocket: object, close_timeout: float | None) -> None:
+        self._ws = js_websocket
+        self._close_timeout = math.inf if close_timeout is None else close_timeout
+        # Messages wait here until recv() takes them. There's no limit,
+        # because a browser can't be asked to stop receiving.
+        channels = trio.open_memory_channel[str | bytes](math.inf)
+        self._send_channel, self._receive_channel = channels
+        self._send_lock = trio.Lock()
+        self._opened = False
+        self._error_message = ""
+        # Set once the handshake has succeeded or failed
+        self._handshake_done = trio.Event()
+        # (code, reason, was_clean) once the connection is over. That's
+        # usually when the browser says it has closed, but see _finish().
+        self._close_info: tuple[int, str, bool] | None = None
+        self._closed = trio.Event()
+        # The code we asked the browser to close with, if we closed first
+        self._sent_close_code: int | None = None
+
+        js_websocket.binaryType = "arraybuffer"
+        self._handlers = {
+            "onopen": create_proxy(self._on_open),
+            "onmessage": create_proxy(self._on_message),
+            "onerror": create_proxy(self._on_error),
+            "onclose": create_proxy(self._on_close),
+        }
+        for name, handler in self._handlers.items():
+            setattr(js_websocket, name, handler)
+
+    def __repr__(self) -> str:
+        return f"<trio.pyodide.WebSocketConnection {self.state.name} {self._ws.url!r}>"
+
+    # The event handlers. JavaScript calls these from the browser's event
+    # loop, between Trio's ticks, so like any host code they may only use
+    # Trio's synchronous functions.
+
+    def _on_open(self, event: object) -> None:
+        self._opened = True
+        self._handshake_done.set()
+
+    def _on_message(self, event: object) -> None:
+        data = event.data
+        if not isinstance(data, str):
+            data = data.to_bytes()
+        self._send_channel.send_nowait(data)
+
+    def _on_error(self, event: object) -> None:
+        if self._opened:
+            # An open connection broke. A close event always follows, and
+            # says all that the browser is willing to (code 1006).
+            return
+        # The connection couldn't be made. Browsers follow this with a close
+        # event that adds nothing, and Node (as of version 22) with no event
+        # at all, so this is where a connection attempt ends. Browsers say
+        # nothing about what went wrong; some other runtimes give a message.
+        message = getattr(event, "message", None)
+        if isinstance(message, str):
+            self._error_message = message
+        self._finish(_ABNORMAL_CLOSURE, "", False)
+
+    def _on_close(self, event: object) -> None:
+        self._finish(event.code, event.reason, event.wasClean)
+
+    def _finish(self, code: int, reason: str, was_clean: bool) -> None:
+        # The connection is over, as far as this object is concerned. Usually
+        # that's because the browser said so (a close event), but we also get
+        # here by giving up: on a connection attempt that failed, timed out or
+        # was cancelled, or on a closing handshake that the server didn't
+        # complete in time.
+        #
+        # Either way, the browser has nothing more to tell us that we'd act
+        # on, so this lets go of the event handlers. That means JavaScript
+        # never calls into this object after the connection is finished, and
+        # in particular never after the 'async with' block that owns it has
+        # exited, whatever the browser does with the socket afterwards.
+        if self._close_info is not None:
+            return
+        self._close_info = (code, reason, was_clean)
+        handlers, self._handlers = self._handlers, {}
+        for name, handler in handlers.items():
+            setattr(self._ws, name, None)
+            handler.destroy()
+        self._send_channel.close()
+        self._handshake_done.set()
+        self._closed.set()
+
+    def _abandon(self) -> None:
+        # Give up on the connection without a closing handshake. The handlers
+        # go first, because close() can fire an error event synchronously
+        # (Node does when the connection hasn't been made yet).
+        self._finish(_ABNORMAL_CLOSURE, "", False)
+        self._ws.close()
+
+    def _close_exc(self) -> ConnectionClosed:
+        assert self._close_info is not None
+        code, reason, was_clean = self._close_info
+        ok = (
+            was_clean
+            and code in _OK_CLOSE_CODES
+            and (
+                self._sent_close_code is None
+                or self._sent_close_code in _OK_CLOSE_CODES
+            )
+        )
+        exc_type = ConnectionClosedOK if ok else ConnectionClosedError
+        return exc_type(code, reason, was_clean)
+
+    @property
+    def state(self) -> WebSocketState:
+        """The connection's state, a `WebSocketState`. This is here for
+        completeness; normally you'd just call `send` or `recv`, and handle
+        `ConnectionClosed`."""
+        if self._close_info is not None:
+            return WebSocketState.CLOSED
+        return WebSocketState(self._ws.readyState)
+
+    @property
+    def subprotocol(self) -> str | None:
+        """The subprotocol the server selected, or ``None`` if it didn't
+        select one."""
+        return self._ws.protocol or None
+
+    @property
+    def close_code(self) -> int | None:
+        """The close code, as for `ConnectionClosed`; ``None`` until the
+        connection is closed."""
+        return None if self._close_info is None else self._close_info[0]
+
+    @property
+    def close_reason(self) -> str | None:
+        """The close reason, as for `ConnectionClosed`; ``None`` until the
+        connection is closed."""
+        return None if self._close_info is None else self._close_info[1]
+
+    async def recv(self, decode: bool | None = None) -> str | bytes:
+        """Receive the next message: a `str` for a text message, or a `bytes`
+        for a binary one.
+
+        Pass ``decode=True`` to get a binary message as a `str` too (decoded
+        as UTF-8), or ``decode=False`` to get a text message as `bytes`.
+
+        Once the connection has closed, and the messages that arrived before
+        that have all been received, this raises `ConnectionClosed`:
+        `ConnectionClosedOK` after a normal closure, and
+        `ConnectionClosedError` otherwise.
+
+        Cancelling this is safe: no message is lost, and the next call
+        returns the next message. Messages that arrive while nobody is
+        receiving are kept, without limit, because a browser can't be told to
+        stop reading from a WebSocket.
+
+        """
+        try:
+            message = await self._receive_channel.receive()
+        except trio.EndOfChannel:
+            raise self._close_exc() from None
+        if decode is True and not isinstance(message, str):
+            return message.decode()
+        if decode is False and isinstance(message, str):
+            return message.encode()
+        return message
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> str | bytes:
+        # Iteration ends when the connection is closed normally, and raises
+        # ConnectionClosedError if it ends any other way.
+        try:
+            return await self.recv()
+        except ConnectionClosedOK:
+            raise StopAsyncIteration from None
+
+    async def send(
+        self,
+        message: str | bytes | bytearray | memoryview,
+        *,
+        text: bool | None = None,
+    ) -> None:
+        """Send a message: a `str` as a text message, and `bytes` (or a
+        `bytearray` or `memoryview`) as a binary one.
+
+        Pass ``text=True`` to send bytes that hold UTF-8 as a text message,
+        or ``text=False`` to send a `str` as a binary message.
+
+        If the browser already has a lot of data queued for this connection,
+        this first waits for it to send some of that. Cancelling this is
+        safe: if it raises `~trio.Cancelled`, the message has not been sent,
+        and otherwise all of it has been handed to the browser.
+
+        Raises `ConnectionClosed` if the connection is closed, like `recv`.
+
+        """
+        data: object
+        if isinstance(message, str):
+            data = message if text is not False else to_js(message.encode())
+        elif isinstance(message, (bytes, bytearray, memoryview)):
+            data = str(message, "utf-8") if text else to_js(message)
+        else:
+            raise TypeError(
+                f"a message must be a str or bytes-like, not {type(message).__name__}",
+            )
+        # The lock keeps tasks that are waiting to send in order. Taking it
+        # is also this function's checkpoint; after that, nothing below can
+        # be interrupted between deciding to send and having sent.
+        async with self._send_lock:
+            while True:
+                if (
+                    self._close_info is not None
+                    or self._ws.readyState != WebSocketState.OPEN
+                ):
+                    # Closed, or closing, in which case wait to see how
+                    await self._closed.wait()
+                    raise self._close_exc()
+                if self._ws.bufferedAmount <= _SEND_HIGH_WATER_MARK:
+                    break
+                await trio.sleep(_SEND_POLL_INTERVAL)
+            self._ws.send(data)
+
+    async def aclose(self, code: int = 1000, reason: str = "") -> None:
+        """Close the connection: start the closing handshake, sending the
+        server ``code`` and ``reason``, and wait for it to finish.
+
+        If the server hasn't completed the handshake after ``close_timeout``
+        seconds (see `connect_websocket`), or this is cancelled, the wait is
+        abandoned and the connection counts as closed abnormally, with close
+        code 1006; the browser finishes with the socket in its own time. So
+        the connection is always closed when this returns or raises.
+
+        Browsers only allow scripts the close code 1000 (normal closure) and
+        the codes from 3000 to 4999, and a reason of at most 123 bytes;
+        anything else is a `ValueError`. Closing a connection that's already
+        closed, or closing, has no further effect.
+
+        """
+        if code != 1000 and not 3000 <= code <= 4999:
+            raise ValueError(
+                "a browser can only close a WebSocket with code 1000, or a code "
+                f"from 3000 to 4999, not {code}",
+            )
+        if len(reason.encode()) > 123:
+            raise ValueError("a close reason can be at most 123 bytes of UTF-8")
+        if self._close_info is None:
+            if self._ws.readyState == WebSocketState.OPEN:
+                self._sent_close_code = code
+            # (This does nothing if the browser is already closing it.)
+            self._ws.close(code, reason)
+        try:
+            with trio.move_on_after(self._close_timeout):
+                await self._closed.wait()
+        finally:
+            self._finish(_ABNORMAL_CLOSURE, "", False)
+
+    async def wait_closed(self) -> None:
+        """Wait until the connection is closed."""
+        await self._closed.wait()
+
+
+@asynccontextmanager
+async def connect_websocket(
+    uri: str,
+    *,
+    subprotocols: Sequence[str] | None = None,
+    open_timeout: float | None = 10,
+    close_timeout: float | None = 10,
+) -> AsyncIterator[WebSocketConnection]:
+    """Connect to a WebSocket server, using the browser's ``WebSocket``.
+
+    This is an async context manager, giving a `WebSocketConnection`::
+
+        async with trio.pyodide.connect_websocket("wss://example.com/chat") as ws:
+            await ws.send("hello")
+            reply = await ws.recv()
+
+    The connection is closed when the block exits, as if by
+    `WebSocketConnection.aclose`.
+
+    Args:
+      uri: The server's URI, such as ``wss://example.com/chat``. The browser
+          is what interprets it, so one without a scheme is taken relative to
+          the page's.
+      subprotocols: The subprotocols to offer the server, in order of
+          preference. Its choice is the connection's ``subprotocol``.
+      open_timeout: How long to wait for the connection to be made, in
+          seconds; ``None`` waits indefinitely.
+      close_timeout: How long `WebSocketConnection.aclose` waits for the
+          server to complete the closing handshake, in seconds; ``None``
+          waits indefinitely.
+
+    Raises:
+      InvalidHandshake: if the connection can't be made.
+      TimeoutError: if that takes longer than ``open_timeout``.
+      pyodide.ffi.JsException: if the browser won't even try, because the URI
+          or subprotocols are invalid, or because its security policy forbids
+          the connection (an insecure ``ws`` URI from a page loaded over
+          HTTPS, for example).
+
+    Cancelling the wait for the connection abandons the attempt.
+
+    The API follows the `websockets <https://websockets.readthedocs.io/>`__
+    library's Trio implementation, ``websockets.trio``, so that a program can
+    use that natively and this in a browser. It's a subset, because a browser
+    keeps much of the protocol to itself. It doesn't let a script send or
+    see pings, set HTTP headers, choose extensions or limits, or use a proxy
+    of its own choosing; it doesn't report why a handshake failed; it only
+    sends and delivers whole messages; and it won't close with code 1011
+    when the block exits with an exception, as that library does.
+
+    """
+    if isinstance(subprotocols, str):
+        raise TypeError("subprotocols must be a sequence of str, not a str")
+    if subprotocols:
+        js_websocket = js.WebSocket.new(uri, to_js(list(subprotocols)))
+    else:
+        js_websocket = js.WebSocket.new(uri)
+    connection = WebSocketConnection._create(js_websocket, close_timeout)
+    try:
+        with trio.fail_after(math.inf if open_timeout is None else open_timeout):
+            await connection._handshake_done.wait()
+    except BaseException as exc:
+        # Closing a WebSocket that's still connecting abandons the attempt
+        connection._abandon()
+        if isinstance(exc, trio.TooSlowError):
+            raise TimeoutError("timed out during opening handshake") from exc
+        raise
+    if not connection._opened:
+        message = f"couldn't open a WebSocket connection to {uri!r}"
+        if connection._error_message:
+            message += f": {connection._error_message}"
+        raise InvalidHandshake(message)
+    try:
+        yield connection
+    finally:
+        await connection.aclose()
