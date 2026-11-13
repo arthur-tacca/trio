@@ -1069,7 +1069,9 @@ of a guest run on the browser's event loop, and returns at once with a
 JavaScript ``Promise`` that is fulfilled with the return value, or
 rejected with the exception (converted as described for
 ``callable_from_js`` below). It takes the same keyword arguments as
-`trio.run`. Await the promise from JavaScript::
+`trio.run`. Await the promise from JavaScript:
+
+.. code-block:: javascript
 
    const result = await pyodide.runPython("trio.pyodide.run(app.main)");
 
@@ -1097,7 +1099,7 @@ function, waits for the promise it returns if it returns one, and
 gives you the result. ``await trio.pyodide.call_method(obj, name,
 *args)`` does the same for a method, with ``obj`` as ``this``. If the
 function throws, or its promise is rejected, with a JavaScript
-``Error``, that's raised, as a `pyodide.ffi.JsException`; anything
+``Error``, that's raised, as a ``pyodide.ffi.JsException``; anything
 else it's rejected with is wrapped in ``trio.pyodide.JsPromiseRejected``.
 
 These call the function from JavaScript, so that its promise never
@@ -1107,7 +1109,7 @@ doesn't work, and handing it back to JavaScript gives you a different,
 derived promise. If you already have such a converted promise, ``await
 trio.pyodide.wait_promise(promise)`` waits for it, through the
 future's ``then`` method, with the same results and cancellation
-behaviour as `call`.
+behaviour as ``call``.
 
 JavaScript promises can't be cancelled, so cancelling a task that's
 waiting on one doesn't interrupt it: the task keeps waiting until the
@@ -1142,15 +1144,18 @@ a JavaScript ``Promise`` for its result::
 
    js.myApp.fetchUser = trio.pyodide.callable_from_js(fetch_user)
 
-   // and then, in JavaScript:
+and then, in JavaScript:
+
+.. code-block:: javascript
+
    const user = await myApp.fetchUser(42);
    const controller = new AbortController();
    await myApp.fetchUser.callKwargs(42, { signal: controller.signal });
 
-The return value is converted with `pyodide.ffi.to_js`. If the task
+The return value is converted with ``pyodide.ffi.to_js``. If the task
 raises, the promise is rejected with an ``Error`` whose ``name`` is the
 exception type's name and whose ``stack`` is the Python traceback, or,
-for a `pyodide.ffi.JsException`, with the JavaScript error it wraps;
+for a ``pyodide.ffi.JsException``, with the JavaScript error it wraps;
 the exception goes to the JavaScript caller only.
 ``trio.pyodide.cancel_on_abort(signal)`` is the converse of
 ``abort_signal``: a cancel scope that an ``AbortSignal`` cancels. When
@@ -1187,7 +1192,7 @@ while waiting for the response and while reading its body::
 ``body`` can be bytes-like or a string; other keyword arguments are
 passed through to ``fetch`` as request options, such as
 ``credentials="include"``. Network failures are raised as
-`pyodide.ffi.JsException`. Once a request has been aborted, reading
+``pyodide.ffi.JsException``. Once a request has been aborted, reading
 anything more from it raises `~trio.BrokenResourceError`.
 
 
