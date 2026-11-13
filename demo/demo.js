@@ -34,6 +34,10 @@ try {
   $("cancel-btn").onclick = () => globalThis.cancelNursery();
   $("fetch-btn").onclick = () => globalThis.fetchHello();
   $("fetch-cancel-btn").onclick = () => globalThis.fetchCancelled();
+  $("ws-connect-btn").onclick = () => globalThis.connectWebSocket($("ws-url").value);
+  $("ws-disconnect-btn").onclick = () => globalThis.disconnectWebSocket();
+  $("ws-send-btn").onclick = () => globalThis.sendWebSocket($("ws-message").value);
+  $("ws-message").onkeydown = (event) => { if (event.key === "Enter") $("ws-send-btn").click(); };
   $("js-call-btn").onclick = async () => {
     $("js-call-out").textContent = "waiting…";
     const result = await globalThis.trioDouble(21);

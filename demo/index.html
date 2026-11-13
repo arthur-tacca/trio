@@ -9,8 +9,9 @@
     section { margin: 1.5rem 0; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; }
     h2 { margin-top: 0; font-size: 1.1rem; }
     button { margin-right: .5rem; }
+    input { font: inherit; margin: 0 .5rem .5rem 0; max-width: 100%; }
     pre { background: #f4f4f4; padding: .5rem; white-space: pre-wrap; }
-    #trace { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; white-space: pre-wrap; }
+    #trace, #ws-trace { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; white-space: pre-wrap; }
     #status { font-weight: bold; }
     .muted { color: #666; }
   </style>
@@ -32,6 +33,21 @@
     <button id="fetch-btn" disabled>Fetch hello.txt</button>
     <button id="fetch-cancel-btn" disabled>Stream a file, cancelled after 0.3 s</button>
     <pre id="fetch-out"></pre>
+  </section>
+
+  <section>
+    <h2>A WebSocket connection</h2>
+    <input id="ws-url" list="ws-servers" size="30" value="wss://echo.websocket.org" aria-label="WebSocket server">
+    <datalist id="ws-servers">
+      <option value="wss://echo.websocket.org"></option>
+      <option value="wss://ws.postman-echo.com/raw"></option>
+    </datalist>
+    <button id="ws-connect-btn" disabled>Connect</button>
+    <button id="ws-disconnect-btn" disabled>Disconnect</button>
+    <br>
+    <input id="ws-message" size="30" value="hello from Trio" aria-label="Message">
+    <button id="ws-send-btn" disabled>Send</button>
+    <ul id="ws-trace"></ul>
   </section>
 
   <section>

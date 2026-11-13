@@ -7,8 +7,16 @@ https://arthur-tacca.github.io/trio/ by the "Pyodide demo" workflow, which
 rebuilds the Trio wheel from the branch on every push.
 
 The page shows five sleeping tasks in a nursery that a button can cancel,
-`trio.pyodide.fetch` with a Trio timeout aborting a streaming fetch, and
+`trio.pyodide.fetch` with a Trio timeout aborting a streaming fetch, a
+WebSocket connection made with `trio.pyodide.connect_websocket`, and
 JavaScript awaiting a Trio async function.
+
+Almost everything the page uses is served from the page's own site. The two
+exceptions are Pyodide itself, which comes from the jsDelivr CDN, and the
+WebSocket section, which needs a server to talk to and so connects to a public
+echo server: `wss://echo.websocket.org` unless you change the address. That's
+somebody else's free service, with no promise that it stays up; if it doesn't
+answer, try another, such as `wss://ws.postman-echo.com/raw`, or your own.
 
 ## Files
 
