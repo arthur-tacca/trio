@@ -3,24 +3,57 @@
 // See README.rst.
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
 // Pyodide's own Node.js package depends on this one, so it's already installed
 import { WebSocketServer } from "ws";
 
+// What a test can't see from its own side: the requests whose client went
+// away before the response was complete, and how each WebSocket connection
+// was closed. Tests read it back from /log. An entry names the address that
+// was asked for, so a test tells its own apart by adding a query string.
+const log = [];
+
 function handleHttp(req, res) {
-  if (req.url === "/hello") {
+  const path = req.url.split("?")[0];
+  res.on("close", () => {
+    if (!res.writableFinished) log.push(`abandoned ${req.url}`);
+  });
+  // For tests that run in a real browser, where the page comes from elsewhere
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-expose-headers", "*");
+  if (req.method === "OPTIONS") {
+    res.setHeader("access-control-allow-methods", "*");
+    res.setHeader("access-control-allow-headers", "*");
+    res.end();
+  } else if (path === "/hello") {
     res.setHeader("content-type", "text/plain");
     res.end("hello from node");
-  } else if (req.url === "/echo") {
+  } else if (path === "/echo") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => res.end(`${req.method} ${req.headers["x-test"]} ${body}`));
-  } else if (req.url === "/json") {
+  } else if (path === "/echo-raw") {
+    // The request's body, byte for byte
+    res.setHeader("content-type", "application/octet-stream");
+    req.pipe(res);
+  } else if (path === "/json") {
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ answer: 42, list: [1, 2, 3] }));
-  } else if (req.url === "/slow") {
+  } else if (path === "/gzip") {
+    res.setHeader("content-type", "text/plain");
+    res.setHeader("content-encoding", "gzip");
+    res.end(gzipSync("squashed ".repeat(50)));
+  } else if (path === "/redirect") {
+    res.writeHead(302, { location: "/hello" });
+    res.end();
+  } else if (path === "/cookies") {
+    // Says which cookies came with the request, and sets one
+    res.setHeader("set-cookie", "flavour=oat");
+    res.end(req.headers.cookie ?? "none");
+  } else if (path === "/slow") {
     const timer = setTimeout(() => res.end("slow done"), 1000);
     req.on("close", () => clearTimeout(timer));
-  } else if (req.url === "/stream") {
+  } else if (path === "/stream") {
     res.writeHead(200);
     let i = 0;
     const interval = setInterval(() => {
@@ -28,6 +61,13 @@ function handleHttp(req, res) {
       if (i === 5) { clearInterval(interval); res.end(); }
     }, 40);
     req.on("close", () => clearInterval(interval));
+  } else if (path === "/stall") {
+    // Start a response, and never finish it
+    res.writeHead(200);
+    res.write("first\n");
+  } else if (path === "/log") {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(log));
   } else {
     res.statusCode = 404;
     res.end("nope");
@@ -37,6 +77,7 @@ function handleHttp(req, res) {
 // WebSocket endpoints that behave: these are handled by the 'ws' library
 function handleWebSocket(ws, req) {
   const url = new URL(req.url, "http://localhost");
+  ws.on("close", (code, reason) => log.push(`closed ${req.url} ${code} ${reason}`));
   if (url.pathname === "/ws/echo") {
     ws.on("message", (data, isBinary) => ws.send(data, { binary: isBinary }));
   } else if (url.pathname === "/ws/close") {
@@ -52,6 +93,10 @@ function handleWebSocket(ws, req) {
   } else if (url.pathname === "/ws/vanish") {
     // Drop the connection without a closing handshake
     ws.send("about to vanish", () => ws.terminate());
+  } else if (url.pathname === "/ws/flood") {
+    // Send without a pause, for as long as the connection lasts
+    const interval = setInterval(() => ws.send("flood ".repeat(20)), 2);
+    ws.on("close", () => clearInterval(interval));
   } else {
     ws.close(4404, "no such endpoint");
   }
@@ -88,9 +133,11 @@ export async function startTestServer() {
   });
   wss.on("connection", handleWebSocket);
   const sockets = new Set();
-  server.on("upgrade", (req, socket, head) => {
+  server.on("connection", (socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
+  });
+  server.on("upgrade", (req, socket, head) => {
     socket.on("error", () => {});
     handleUpgrade(wss, req, socket, head);
   });

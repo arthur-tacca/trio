@@ -1,9 +1,10 @@
 // Runs the *_test.py files in this directory inside Pyodide under Node.js,
 // each in its own process, with a local server (test_server.mjs) for them to
-// talk to. See README.rst.
-import { spawnSync } from "node:child_process";
+// talk to. With --native=PYTHON it runs them with that Python instead, for
+// the tests that can do both. See README.rst.
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { startTestServer } from "./test_server.mjs";
@@ -23,15 +24,35 @@ if (options.file === undefined) {
   let failed = 0;
   for (const file of files) {
     console.log(`\n=== ${file}`);
-    const result = spawnSync(
-      process.execPath,
-      [fileURLToPath(import.meta.url), `--file=${file}`, `--src=${srcDir}`, `--deps=${depsDir}`],
-      { stdio: "inherit" },
-    );
+    const args = [fileURLToPath(import.meta.url), `--file=${file}`, `--src=${srcDir}`, `--deps=${depsDir}`];
+    if (options.native !== undefined) args.push(`--native=${options.native}`);
+    const result = spawnSync(process.execPath, args, { stdio: "inherit" });
     if (result.status !== 0) failed += 1;
   }
   console.log(`\n${files.length - failed} of ${files.length} test files passed`);
   process.exitCode = failed ? 1 : 0;
+} else if (options.native !== undefined) {
+  // Child, outside Pyodide: a server, then the test file under an ordinary
+  // Python, which is told where the server is through its environment.
+  const server = await startTestServer();
+  const python = spawn(options.native, [resolve(here, options.file)], {
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      PYTHONPATH: [srcDir, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+      TEST_BASE_URL: server.baseUrl,
+      TEST_CLOSED_URL: server.closedUrl,
+    },
+  });
+  python.on("error", (error) => {
+    console.error(`couldn't run ${options.native}: ${error.message}`);
+    server.stop();
+    process.exitCode = 1;
+  });
+  python.on("exit", (code) => {
+    server.stop();
+    process.exitCode = code ?? 1;
+  });
 } else {
   // Child: a server for the tests to talk to, then the test file itself.
   const server = await startTestServer();

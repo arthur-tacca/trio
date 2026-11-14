@@ -1243,6 +1243,45 @@ to stop reading from a WebSocket, so messages that arrive faster than
 you receive them are queued without limit, where ``websockets`` would
 make the server wait.
 
+**httpx2, as a proof of concept:** `httpx2
+<https://github.com/pydantic/httpx2>`__ is an HTTP client, and a
+WebSocket client, that works with Trio. On other platforms it uses
+sockets. In a browser it needs a *transport* that goes through the
+browser, and the one it comes with only works under asyncio, and
+doesn't do WebSockets. ``trio._pyodide_httpx2`` has one for Trio, built
+on ``trio.pyodide.fetch`` and ``trio.pyodide.connect_websocket``::
+
+   import httpx2
+   from trio._pyodide_httpx2 import BrowserTransport
+
+   async with httpx2.AsyncClient(transport=BrowserTransport()) as client:
+       response = await client.get("https://example.com/")
+       async with client.websocket("wss://example.com/chat") as ws:
+           await ws.send_text("hello")
+           reply = await ws.receive_text()
+
+With that one argument, a program written for httpx2 runs under Trio
+both natively and in a browser, and cancelling a task aborts its
+request in both. What's different in a browser is whatever the browser
+keeps to itself. It follows redirects on its own, and doesn't say where
+it has been. It handles cookies on its own, and ignores httpx2's. It
+doesn't say when it has connected, so a server that's slow to answer is
+a ``ConnectTimeout``, not a ``ReadTimeout``. It doesn't say why a
+WebSocket handshake failed, so that's a ``ConnectError`` with no
+response to look at. It won't send your headers or cookies with a
+WebSocket handshake, it only lets a script close a WebSocket with code
+1000 or one from 3000 to 4999, and it keeps pings to itself, so
+httpx2's own are answered without reaching the server. The class's
+docstring has the whole list, and ``tests/pyodide/httpx2_test.py`` is a
+program that runs both ways and checks all of it.
+
+The module has a private name on purpose. It's here to keep this
+experiment in one place, and it doesn't belong in Trio: httpx2 depends
+on Trio, not the other way round. So Trio doesn't depend on httpx2, and
+you need to install that yourself, along with ``wsproto``, ``anyio``
+and ``httpcore2`` if you want WebSockets (httpx2 leaves the last two
+out on Emscripten).
+
 
 Limitations
 -----------

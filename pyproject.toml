@@ -315,6 +315,9 @@ omit = [
     "*/trio/_tests/check_type_completeness.py",
     # Script to generate a CFFI interface for the Windows kernel
     "*/trio/_tools/windows_ffi_build.py",
+    # A proof of concept that needs httpx2, which isn't a test requirement.
+    # Its tests are tests/pyodide/httpx2_test.py, which runs inside Pyodide.
+    "*/trio/_pyodide_httpx2.py",
 ]
 # The test suite spawns subprocesses to test some stuff, so make sure
 # this doesn't corrupt the coverage files
